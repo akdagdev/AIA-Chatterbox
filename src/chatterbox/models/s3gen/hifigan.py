@@ -469,8 +469,6 @@ class HiFTGenerator(nn.Module):
         s = s.transpose(1, 2)
         # use cache_source to avoid glitch
         if cache_source.shape[2] != 0:
-            # Clip to the minimum length to handle variable chunk sizes
-            min_len = min(s.shape[2], cache_source.shape[2])
-            s[:, :, :min_len] = cache_source[:, :, :min_len]
+            s[:, :, :cache_source.shape[2]] = cache_source
         generated_speech = self.decode(x=speech_feat, s=s)
         return generated_speech, s
