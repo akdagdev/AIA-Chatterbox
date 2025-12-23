@@ -298,3 +298,91 @@ class ChatterboxTTS:
 
             return speech_to_wav(speech_tokens)
 
+    def generate_chunked(
+        self,
+        text: str,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        max_new_tokens=1000,
+        max_cache_len=1500,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        verbose=True,
+    ):
+        """
+        Generate audio by splitting text into sentences and processing each with batch mode.
+        
+        This provides streaming-like behavior while maintaining optimal RTF (~0.2).
+        
+        Args:
+            text: Full text to synthesize.
+            verbose: If True, print timing metrics.
+            
+        Yields:
+            Tuple[torch.Tensor, dict]: (audio_chunk, metrics) for each sentence.
+                metrics contains: 'sentence', 'rtf', 'duration', 'gen_time'
+        """
+        import re
+        import time
+        
+        # Split text into sentences
+        sentence_pattern = r'(?<=[.!?])\s+'
+        sentences = re.split(sentence_pattern, text.strip())
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        if not sentences:
+            return
+        
+        # Prepare conditionals once
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        
+        total_audio_duration = 0
+        total_gen_time = 0
+        
+        for i, sentence in enumerate(sentences):
+            start_time = time.perf_counter()
+            
+            # Generate audio for this sentence
+            wav = self.generate(
+                sentence,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                max_cache_len=max_cache_len,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            )
+            
+            end_time = time.perf_counter()
+            gen_time = end_time - start_time
+            audio_duration = wav.shape[1] / self.sr
+            rtf = gen_time / audio_duration
+            
+            total_audio_duration += audio_duration
+            total_gen_time += gen_time
+            
+            metrics = {
+                "sentence": sentence,
+                "sentence_idx": i + 1,
+                "total_sentences": len(sentences),
+                "rtf": rtf,
+                "duration": audio_duration,
+                "gen_time": gen_time,
+            }
+            
+            if verbose:
+                print(f"[{i+1}/{len(sentences)}] RTF: {rtf:.4f} | Duration: {audio_duration:.2f}s | \"{sentence[:50]}...\"" if len(sentence) > 50 else f"[{i+1}/{len(sentences)}] RTF: {rtf:.4f} | Duration: {audio_duration:.2f}s | \"{sentence}\"")
+            
+            yield wav, metrics
+        
+        if verbose:
+            overall_rtf = total_gen_time / total_audio_duration
+            print(f"\n[Summary] Overall RTF: {overall_rtf:.4f} | Total Audio: {total_audio_duration:.2f}s | Total Time: {total_gen_time:.2f}s")
+
+
