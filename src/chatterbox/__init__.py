@@ -9,4 +9,3 @@ __version__ = version("tts-webui.chatterbox-tts")
 from .tts import ChatterboxTTS
 from .vc import ChatterboxVC
 from .mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
-from .tts_stream import ChatterboxTTSStream
