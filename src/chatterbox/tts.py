@@ -127,7 +127,7 @@ class ChatterboxTTS:
         self.watermarker = perth.PerthImplicitWatermarker()
 
     @classmethod
-    def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
+    def from_local(cls, ckpt_dir, device, compile_s3gen: bool = False) -> 'ChatterboxTTS':
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
@@ -149,7 +149,7 @@ class ChatterboxTTS:
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
 
-        s3gen = S3Gen()
+        s3gen = S3Gen(compile_model=compile_s3gen)
         s3gen.load_state_dict(
             load_file(ckpt_dir / "s3gen.safetensors"), strict=False
         )
@@ -166,7 +166,7 @@ class ChatterboxTTS:
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
 
     @classmethod
-    def from_pretrained(cls, device) -> 'ChatterboxTTS':
+    def from_pretrained(cls, device, compile_s3gen: bool = False) -> 'ChatterboxTTS':
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
@@ -178,7 +178,7 @@ class ChatterboxTTS:
         for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
             local_path = hf_hub_download(repo_id=REPO_ID, filename=fpath)
 
-        return cls.from_local(Path(local_path).parent, device)
+        return cls.from_local(Path(local_path).parent, device, compile_s3gen=compile_s3gen)
 
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         ## Load reference wav

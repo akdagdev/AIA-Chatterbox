@@ -14,11 +14,17 @@ from chatterbox.tts import ChatterboxTTS
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile for S3Gen")
+    args = parser.parse_args()
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    print(f"Compile S3Gen: {args.compile}")
     print("="*80)
     
-    model = ChatterboxTTS.from_pretrained(device=device)
+    model = ChatterboxTTS.from_pretrained(device=device, compile_s3gen=args.compile)
     
     text = """This is a chunked generation test, each sentence is processed separately. 
     This maintains optimal RTF while enabling streaming-like behavior.

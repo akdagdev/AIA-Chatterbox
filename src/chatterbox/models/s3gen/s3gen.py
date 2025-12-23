@@ -221,7 +221,7 @@ class S3Token2Wav(S3Token2Mel):
     TODO: make these modules configurable?
     """
 
-    def __init__(self):
+    def __init__(self, compile_model: bool = False):
         super().__init__()
 
         f0_predictor = ConvRNNF0Predictor()
@@ -239,6 +239,11 @@ class S3Token2Wav(S3Token2Mel):
         trim_fade = torch.zeros(2 * n_trim)
         trim_fade[n_trim:] = (torch.cos(torch.linspace(torch.pi, 0, n_trim)) + 1) / 2
         self.register_buffer("trim_fade", trim_fade, persistent=False) # (buffers get automatic device casting)
+
+        # Optional torch.compile for performance optimization
+        if compile_model:
+            self.flow = torch.compile(self.flow, mode="reduce-overhead")
+            self.mel2wav = torch.compile(self.mel2wav, mode="reduce-overhead")
 
     def forward(
         self,
