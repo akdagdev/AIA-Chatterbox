@@ -3,10 +3,6 @@ Example: Streaming TTS with Chatterbox
 
 This script demonstrates real-time audio generation using the streaming API.
 """
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
-
 import torch
 import torchaudio as ta
 from chatterbox.tts_stream import ChatterboxTTSStream
