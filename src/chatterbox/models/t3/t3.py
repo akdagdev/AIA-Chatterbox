@@ -551,6 +551,206 @@ class T3(nn.Module):
 
         return generated_ids
 
+    @torch.inference_mode()
+    def inference_stream(
+        self,
+        *,
+        t3_cond: T3Cond,
+        text_tokens: Tensor,
+        initial_speech_tokens: Optional[Tensor]=None,
+
+        # misc conditioning
+        prepend_prompt_speech_tokens: Optional[Tensor]=None,
+
+        # HF generate args
+        num_return_sequences=1,
+        max_new_tokens=None,
+        stop_on_eos=True,
+        do_sample=True,
+        temperature=0.8,
+        min_p=0.05,
+        top_p=1.0,
+        length_penalty=1.0,
+        repetition_penalty=1.2,
+        cfg_weight=0,
+        # optimizations
+        max_cache_len=1500,
+        initial_forward_pass_backend="eager",
+        generate_token_backend="cudagraphs-manual",
+        stride_length=4,
+        skip_when_1=True,
+        # streaming params
+        chunk_size: int = 50,  # Yield every N tokens
+    ):
+        """
+        Streaming version of inference that yields token chunks.
+        
+        Args:
+            chunk_size: Number of tokens to generate before yielding a chunk.
+            
+        Yields:
+            Tuple[Tensor, bool]: (token_chunk, is_final) where is_final indicates last chunk.
+        """
+        # Validate / sanitize inputs
+        assert prepend_prompt_speech_tokens is None, "not implemented"
+        _ensure_BOT_EOT(text_tokens, self.hp)
+        text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
+
+        # Default max_new_tokens
+        if max_new_tokens is None:
+            max_new_tokens = self.hp.max_speech_tokens
+
+        # Default initial speech to a single start-of-speech token
+        if initial_speech_tokens is None:
+            initial_speech_tokens = self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+
+        # Prepare custom input embeds
+        embeds, len_cond = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=initial_speech_tokens,
+            cfg_weight=cfg_weight,
+        )
+
+        self.init_patched_model(len_cond=len_cond, text_tokens_size=text_tokens.size(-1))
+        self.get_speech_pos_embedding_cache(TOKEN_LIMIT + 1 or self.hp.max_speech_tokens, dtype=embeds.dtype)
+        self.init_speech_embedding_cache(vocab_size=self.hp.speech_tokens_dict_size, dtype=embeds.dtype)
+
+        device = embeds.device
+
+        bos_token = torch.tensor([[self.hp.start_speech_token]], dtype=torch.long, device=device)
+        bos_embed = self._speech_embedding_cache[bos_token]
+        bos_embed = bos_embed + self._speech_pos_embedding_cache[0]
+
+        # batch_size=2 for CFG
+        if cfg_weight > 0.0:
+            bos_embed = torch.cat([bos_embed, bos_embed])
+
+        inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
+
+        PAD_TOKEN_ID = self.hp.stop_speech_token + 1
+        bos_len = bos_token.shape[1]
+
+        self.update_processors(top_p, min_p, repetition_penalty, skip_when_1=skip_when_1)
+
+        inputs_embeds = inputs_embeds.to(self.patched_model.dtype)
+        embeds = embeds.to(self.patched_model.dtype)
+        bos_embed = bos_embed.to(self.patched_model.dtype)
+
+        stop_token_tensor = torch.tensor(self.hp.stop_speech_token, device=self.device)
+        
+        effective_batch_size = 2 if cfg_weight > 0.0 else 1
+
+        _, seq_len = inputs_embeds.shape[:2]
+        if max_cache_len < seq_len + max_new_tokens:
+            max_new_tokens = max_cache_len - seq_len
+
+        assert max_new_tokens < 1500, f"max_new_tokens {max_new_tokens} is too large"
+        generated_ids = torch.full((1, bos_len + TOKEN_LIMIT), PAD_TOKEN_ID, dtype=torch.long, device=device)
+        generated_ids[0, :bos_len] = bos_token
+
+        kv_cache = self.get_cache(
+            config=self.patched_model.config,
+            max_batch_size=effective_batch_size,
+            max_cache_len=max_cache_len,
+            device=self.patched_model.device,
+            dtype=self.patched_model.dtype,
+        )
+
+        assert not kv_cache.get_seq_length() > 0, \
+            "Cannot process large input when cache already has content"
+
+        length_guesstimate = text_tokens.shape[1] * 2
+
+        def pad_to_fixed_length(inputs_embeds: Tensor, TOKEN_LIMIT: int):
+            PADDED_SEQ_LEN = TOKEN_LIMIT
+            pad_len = PADDED_SEQ_LEN - inputs_embeds.shape[1]
+            pad_shape = list(inputs_embeds.shape)
+            pad_shape[1] = pad_len
+            pad_embeds = torch.zeros(pad_shape, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+            inputs_embeds = torch.cat([inputs_embeds, pad_embeds], dim=1)
+            return inputs_embeds
+        
+        inputs_embeds = pad_to_fixed_length(inputs_embeds, TOKEN_LIMIT)
+
+        initial_forward_pass = _initial_forward_pass_variants.get(initial_forward_pass_backend, _initial_forward_pass_variants["eager"])
+
+        output_logits = initial_forward_pass(
+            inputs_embeds=inputs_embeds,
+            kv_cache=kv_cache,
+            seq_len=seq_len,
+            patched_model=self.patched_model
+        ).clone()
+
+        indices = torch.arange(1, max_new_tokens + 1, device=generated_ids.device)
+        batch_idx = torch.zeros(1, dtype=torch.long, device=generated_ids.device)
+        
+        if generate_token_backend == "cudagraphs-manual":
+            if not hasattr(self, "cudagraph_wrapper"):
+                self.cudagraph_wrapper = T3StepCUDAGraphWrapper(
+                    generate_t3_token,
+                    self.patched_model,
+                    kv_cache,
+                    self.repetition_penalty_processor,
+                    self.min_p_warper,
+                    self.top_p_warper,
+                )
+            self.cudagraph_wrapper.guard()
+            _generate_token_variants["cudagraphs-manual"] = self.cudagraph_wrapper
+
+        generate_token = _generate_token_variants.get(generate_token_backend, _generate_token_variants["eager"])
+        stride_length = stride_length if "stride" in generate_token_backend else 1
+        
+        last_yielded_idx = 0
+        
+        for i in range(max_new_tokens // stride_length):
+            i_tensor = indices[i * stride_length]
+            current_token_idx = (i + 1) * stride_length
+            
+            # Check for EOS token
+            if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
+                if (generated_ids == stop_token_tensor).any():
+                    # Yield final chunk
+                    yield generated_ids[:, last_yielded_idx:current_token_idx].clone(), True
+                    return
+
+            torch.compiler.cudagraph_mark_step_begin()
+            bucket_size = 250
+            max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
+            
+            outputs = generate_token(
+                self._speech_embedding_cache,
+                output_logits,
+                i_tensor,
+                batch_idx,
+                self._speech_pos_embedding_cache,
+                generated_ids,
+                cfg_weight,
+                temperature,
+                self.repetition_penalty_processor,
+                self.min_p_warper,
+                self.top_p_warper,
+                self.patched_model,
+                kv_cache,
+                stride_length,
+                max_position=max_position,
+                alignment_stream_analyzer=self.patched_model.alignment_stream_analyzer,
+            )
+            output_logits = outputs[1]
+            if len(outputs) == 3:
+                generated_ids = outputs[2].clone()
+            output_logits = output_logits.clone()
+
+            # Yield chunk every chunk_size tokens
+            if current_token_idx - last_yielded_idx >= chunk_size:
+                yield generated_ids[:, last_yielded_idx:current_token_idx].clone(), False
+                last_yielded_idx = current_token_idx
+
+        # Yield remaining tokens as final chunk
+        final_idx = (max_new_tokens // stride_length) * stride_length
+        if final_idx > last_yielded_idx:
+            yield generated_ids[:, last_yielded_idx:final_idx].clone(), True
+
 
 def _initial_forward_pass(
     inputs_embeds: Tensor,
