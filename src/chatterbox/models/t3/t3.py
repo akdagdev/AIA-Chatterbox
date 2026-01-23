@@ -690,6 +690,7 @@ class T3(nn.Module):
                 kv_cache,
                 input_batch_size,
                 finished_mask,
+                stop_token_id=self.hp.stop_speech_token,
                 max_position=None,
             )
             output_logits = output_logits.clone()
@@ -866,6 +867,7 @@ def generate_t3_token_batch(
     kv_cache: StaticCache,
     input_batch_size: int,
     finished_mask: Tensor = None,
+    stop_token_id: int = None,
     max_position: Optional[int] = None,
 ):
     """
@@ -898,6 +900,11 @@ def generate_t3_token_batch(
     # Sample next token for each batch item
     probs = torch.softmax(logits, dim=-1)
     next_token = torch.multinomial(probs, num_samples=1)  # shape: (input_batch_size, 1)
+
+    # Force finished items to generate stop_token (prevents hallucination)
+    if finished_mask is not None and stop_token_id is not None:
+        stop_token_tensor = torch.tensor([[stop_token_id]], device=next_token.device, dtype=next_token.dtype)
+        next_token = torch.where(finished_mask.unsqueeze(1), stop_token_tensor, next_token)
 
     # Update generated_ids for each batch item
     # batch_idx is now a tensor of indices [0, 1, 2, ...] 
