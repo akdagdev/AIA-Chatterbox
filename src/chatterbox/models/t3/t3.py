@@ -551,6 +551,159 @@ class T3(nn.Module):
 
         return generated_ids
 
+    @torch.inference_mode()
+    def inference_batch(
+        self,
+        *,
+        t3_cond: T3Cond,
+        text_tokens: Tensor,
+        initial_speech_tokens: Optional[Tensor] = None,
+        max_new_tokens=1000,
+        temperature=0.8,
+        min_p=0.05,
+        top_p=1.0,
+        repetition_penalty=1.2,
+        cfg_weight=0.5,
+        max_cache_len=1500,
+    ):
+        """
+        Batch inference for multiple texts simultaneously.
+        
+        Args:
+            text_tokens: 2D tensor of shape (batch_size * 2, seq_len) when CFG is used,
+                        or (batch_size, seq_len) when cfg_weight=0.
+                        Caller should duplicate tokens for CFG before calling.
+        
+        Returns:
+            generated_ids: Tensor of shape (input_batch_size, max_gen_len) with speech tokens
+        """
+        _ensure_BOT_EOT(text_tokens, self.hp)
+        text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
+        
+        # Calculate actual input batch size (before CFG doubling)
+        if cfg_weight > 0.0:
+            input_batch_size = text_tokens.shape[0] // 2
+        else:
+            input_batch_size = text_tokens.shape[0]
+        
+        # Default initial speech tokens
+        if initial_speech_tokens is None:
+            initial_speech_tokens = self.hp.start_speech_token * torch.ones(
+                text_tokens.shape[0], 1, dtype=torch.long, device=self.device
+            )
+
+        # Prepare embeddings
+        embeds, len_cond = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=initial_speech_tokens,
+            cfg_weight=cfg_weight,
+        )
+
+        self.init_patched_model(len_cond=len_cond, text_tokens_size=text_tokens.size(-1))
+        self.get_speech_pos_embedding_cache(TOKEN_LIMIT + 1, dtype=embeds.dtype)
+        self.init_speech_embedding_cache(vocab_size=self.hp.speech_tokens_dict_size, dtype=embeds.dtype)
+
+        device = embeds.device
+        effective_batch_size = text_tokens.shape[0]  # Already includes CFG doubling
+
+        # BOS embedding for all batch items
+        bos_embed = self._speech_embedding_cache[self.hp.start_speech_token].unsqueeze(0)
+        bos_embed = bos_embed + self._speech_pos_embedding_cache[0]
+        bos_embed = bos_embed.expand(effective_batch_size, -1, -1)  # (eff_batch, 1, dim)
+
+        # Combine condition and BOS
+        inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
+        
+        PAD_TOKEN_ID = self.hp.stop_speech_token + 1
+        bos_len = 1
+
+        self.update_processors(top_p, min_p, repetition_penalty, skip_when_1=False)
+
+        inputs_embeds = inputs_embeds.to(self.patched_model.dtype)
+        stop_token_tensor = torch.tensor(self.hp.stop_speech_token, device=device)
+
+        _, seq_len = inputs_embeds.shape[:2]
+        if max_cache_len < seq_len + max_new_tokens:
+            max_new_tokens = max_cache_len - seq_len
+
+        # Create generated_ids for all batch items
+        generated_ids = torch.full(
+            (input_batch_size, bos_len + TOKEN_LIMIT), 
+            PAD_TOKEN_ID, 
+            dtype=torch.long, 
+            device=device
+        )
+        generated_ids[:, 0] = self.hp.start_speech_token
+
+        # KV Cache with proper batch size
+        kv_cache = self.get_cache(
+            config=self.patched_model.config,
+            max_batch_size=effective_batch_size,
+            max_cache_len=max_cache_len,
+            device=self.patched_model.device,
+            dtype=self.patched_model.dtype,
+        )
+
+        # Pad for compilation stability
+        def pad_to_fixed_length(inputs_embeds: Tensor, limit: int):
+            pad_len = limit - inputs_embeds.shape[1]
+            if pad_len > 0:
+                pad_shape = list(inputs_embeds.shape)
+                pad_shape[1] = pad_len
+                pad = torch.zeros(pad_shape, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+                return torch.cat([inputs_embeds, pad], dim=1)
+            return inputs_embeds
+
+        inputs_embeds = pad_to_fixed_length(inputs_embeds, TOKEN_LIMIT)
+
+        # Initial forward pass
+        cache_position = torch.arange(seq_len, device=device)
+        output_logits = self.patched_model(
+            inputs_embeds=inputs_embeds[:, :seq_len, :],
+            past_key_values=kv_cache,
+            cache_position=cache_position,
+        )
+        output_logits = output_logits[:, -1:, :].clone()
+
+        # EOS tracking per batch item
+        finished_mask = torch.zeros(input_batch_size, dtype=torch.bool, device=device)
+        indices = torch.arange(1, max_new_tokens + 1, device=device)
+        batch_idx = torch.arange(input_batch_size, dtype=torch.long, device=device)
+
+        for i in tqdm(range(max_new_tokens), desc="Batch Sampling", dynamic_ncols=True):
+            i_tensor = indices[i]
+
+            next_token, output_logits = generate_t3_token_batch(
+                self._speech_embedding_cache,
+                output_logits,
+                i_tensor,
+                batch_idx,
+                self._speech_pos_embedding_cache,
+                generated_ids,
+                cfg_weight,
+                temperature,
+                self.repetition_penalty_processor,
+                self.min_p_warper,
+                self.top_p_warper,
+                self.patched_model,
+                kv_cache,
+                input_batch_size,
+                finished_mask,
+                max_position=None,
+            )
+            output_logits = output_logits.clone()
+
+            # Check for EOS per batch item
+            new_eos = (next_token.squeeze(-1) == stop_token_tensor)
+            finished_mask = finished_mask | new_eos
+
+            # Early exit if all items finished
+            if finished_mask.all():
+                break
+
+        return generated_ids
+
 
 def _initial_forward_pass(
     inputs_embeds: Tensor,
@@ -696,3 +849,76 @@ _generate_token_variants = {
     "inductor-strided": torch.compile(generate_t3_tokens_strided, backend="inductor", fullgraph=True, mode="max-autotune"),
 }
 
+
+def generate_t3_token_batch(
+    _speech_embedding_cache: Tensor,
+    output_logits: Tensor,
+    i_tensor: Tensor,
+    batch_idx: Tensor,
+    position_embeds: Tensor,
+    generated_ids: Tensor,
+    cfg_weight: float,
+    temperature: float,
+    repetition_penalty_processor: RepetitionPenaltyLogitsProcessor,
+    min_p_warper: MinPLogitsWarper,
+    top_p_warper: TopPLogitsWarper,
+    patched_model: T3HuggingfaceBackend,
+    kv_cache: StaticCache,
+    input_batch_size: int,
+    finished_mask: Tensor = None,
+    max_position: Optional[int] = None,
+):
+    """
+    Batch-aware token generation for multiple inputs simultaneously.
+    
+    Args:
+        input_batch_size: Number of actual input texts (before CFG doubling)
+        finished_mask: Boolean tensor tracking which batch items have generated EOS
+    """
+    # logits shape: (effective_batch_size, 1, vocab_size) -> (effective_batch_size, vocab_size)
+    logits = output_logits[:, -1, :]
+
+    # CFG: Use torch.chunk for proper batch handling
+    if cfg_weight > 0.0:
+        # Split into conditioned and unconditioned halves
+        logits_cond, logits_uncond = torch.chunk(logits, 2, dim=0)
+        logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
+    
+    # logits shape now: (input_batch_size, vocab_size)
+    
+    # Apply repetition penalty per batch item
+    logits = repetition_penalty_processor(generated_ids, logits)
+
+    if temperature != 1.0:
+        logits = logits / temperature
+
+    logits = min_p_warper(None, logits)
+    logits = top_p_warper(None, logits)
+
+    # Sample next token for each batch item
+    probs = torch.softmax(logits, dim=-1)
+    next_token = torch.multinomial(probs, num_samples=1)  # shape: (input_batch_size, 1)
+
+    # Update generated_ids for each batch item
+    # batch_idx is now a tensor of indices [0, 1, 2, ...] 
+    # i_tensor is a scalar representing current timestep
+    i_expanded = i_tensor.expand(input_batch_size)
+    generated_ids.scatter_(1, i_expanded.unsqueeze(1), next_token)
+
+    # Get embedding for the new tokens
+    position_embed = torch.index_select(position_embeds, 0, i_tensor).squeeze(0)  # (dim,)
+    next_token_embed = _speech_embedding_cache[next_token.squeeze(-1)] + position_embed  # (batch, dim)
+
+    # For CFG: duplicate embeddings
+    if cfg_weight > 0.0:
+        next_token_embed = torch.cat([next_token_embed, next_token_embed], dim=0)
+
+    # Add sequence dimension: (effective_batch, 1, dim)
+    next_token_embed = next_token_embed.unsqueeze(1)
+
+    return next_token, patched_model(
+        inputs_embeds=next_token_embed,
+        past_key_values=kv_cache,
+        cache_position=kv_cache.get_seq_length().unsqueeze(0),
+        max_position=max_position,
+    )

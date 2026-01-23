@@ -32,6 +32,42 @@ class EnTokenizer:
         text_tokens = torch.IntTensor(text_tokens).unsqueeze(0)
         return text_tokens
 
+    def text_to_tokens_batch(
+        self,
+        texts: list,
+        pad_token_id: int = None
+    ) -> tuple:
+        """
+        Batch tokenization with padding and attention mask generation.
+        
+        Args:
+            texts: List of text strings to tokenize
+            pad_token_id: Token ID for padding. If None, uses [PAD] token or 0.
+        
+        Returns:
+            Tuple of (padded_tokens, attention_mask)
+        """
+        if not texts:
+            raise ValueError("texts list cannot be empty")
+        
+        if pad_token_id is None:
+            vocab = self.tokenizer.get_vocab()
+            pad_token_id = vocab.get("[PAD]", 0)
+        
+        token_lists = [self.encode(text) for text in texts]
+        max_len = max(len(tokens) for tokens in token_lists)
+        batch_size = len(texts)
+        
+        padded_tokens = torch.full((batch_size, max_len), pad_token_id, dtype=torch.int)
+        attention_mask = torch.zeros(batch_size, max_len, dtype=torch.float)
+        
+        for i, tokens in enumerate(token_lists):
+            seq_len = len(tokens)
+            padded_tokens[i, :seq_len] = torch.IntTensor(tokens)
+            attention_mask[i, :seq_len] = 1.0
+        
+        return padded_tokens, attention_mask
+
     def encode(self, txt: str):
         """
         clean_text > (append `lang_id`) > replace SPACE > encode text using Tokenizer
@@ -327,6 +363,59 @@ class MTLTokenizer:
         text_tokens = self.encode(text, language_id=language_id, lowercase=lowercase, nfkd_normalize=nfkd_normalize)
         text_tokens = torch.IntTensor(text_tokens).unsqueeze(0)
         return text_tokens
+
+    def text_to_tokens_batch(
+        self,
+        texts: list,
+        language_id: str = None,
+        lowercase: bool = True,
+        nfkd_normalize: bool = True,
+        pad_token_id: int = None
+    ) -> tuple:
+        """
+        Batch tokenization with padding and attention mask generation.
+        
+        Args:
+            texts: List of text strings to tokenize
+            language_id: Language code for all texts (e.g., 'en', 'de')
+            lowercase: Whether to lowercase the text
+            nfkd_normalize: Whether to apply NFKD normalization
+            pad_token_id: Token ID for padding. If None, uses [PAD] token or 0.
+        
+        Returns:
+            Tuple of (padded_tokens, attention_mask)
+            - padded_tokens: torch.IntTensor of shape (batch_size, max_seq_len)
+            - attention_mask: torch.FloatTensor of shape (batch_size, max_seq_len)
+              where 1.0 = real token, 0.0 = padding
+        """
+        if not texts:
+            raise ValueError("texts list cannot be empty")
+        
+        # Determine pad token ID
+        if pad_token_id is None:
+            vocab = self.tokenizer.get_vocab()
+            pad_token_id = vocab.get("[PAD]", 0)
+        
+        # Encode all texts
+        token_lists = [
+            self.encode(text, language_id=language_id, lowercase=lowercase, nfkd_normalize=nfkd_normalize)
+            for text in texts
+        ]
+        
+        # Find max length for padding
+        max_len = max(len(tokens) for tokens in token_lists)
+        batch_size = len(texts)
+        
+        # Create padded tensor and attention mask
+        padded_tokens = torch.full((batch_size, max_len), pad_token_id, dtype=torch.int)
+        attention_mask = torch.zeros(batch_size, max_len, dtype=torch.float)
+        
+        for i, tokens in enumerate(token_lists):
+            seq_len = len(tokens)
+            padded_tokens[i, :seq_len] = torch.IntTensor(tokens)
+            attention_mask[i, :seq_len] = 1.0
+        
+        return padded_tokens, attention_mask
 
     def encode(self, txt: str, language_id: str = None, lowercase: bool = True, nfkd_normalize: bool = True):
         txt = self.preprocess_text(txt, language_id=language_id, lowercase=lowercase, nfkd_normalize=nfkd_normalize)

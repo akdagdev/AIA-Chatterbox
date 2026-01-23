@@ -137,7 +137,8 @@ class MaskedDiffWithXvec(torch.nn.Module):
             prompt_feat = prompt_feat.half()
             embedding = embedding.half()
 
-        assert token.shape[0] == 1
+        assert token.shape[0] == 1  # TODO: Remove for full batch support
+        batch_size = token.shape[0]
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
@@ -160,8 +161,8 @@ class MaskedDiffWithXvec(torch.nn.Module):
         mel_len1, mel_len2 = prompt_feat.shape[1], int(token_len2 / self.input_frame_rate * 22050 / 256)
         h, h_lengths = self.length_regulator.inference(h[:, :token_len1], h[:, token_len1:], mel_len1, mel_len2, self.input_frame_rate)
 
-        # get conditions
-        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
+        # get conditions - now batch-aware
+        conds = torch.zeros([batch_size, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
         conds[:, :mel_len1] = prompt_feat
         conds = conds.transpose(1, 2)
 
@@ -254,7 +255,8 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         embedding = embedding.to(self.spk_embed_affine_layer.weight.dtype)
         prompt_feat = prompt_feat.to(self.spk_embed_affine_layer.weight.dtype)
 
-        assert token.shape[0] == 1
+        assert token.shape[0] == 1  # TODO: Remove for full batch support
+        batch_size = token.shape[0]
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
@@ -271,8 +273,8 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
         h = self.encoder_proj(h)
 
-        # get conditions
-        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
+        # get conditions - now batch-aware
+        conds = torch.zeros([batch_size, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
         conds[:, :mel_len1] = prompt_feat
         conds = conds.transpose(1, 2)
 

@@ -306,3 +306,104 @@ class ChatterboxMultilingualTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def generate_batch(
+        self,
+        texts: list,
+        language_id: str,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        max_new_tokens=1000,
+        max_cache_len=1500,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+    ):
+        """
+        Batch TTS generation for multiple texts simultaneously.
+        
+        Args:
+            texts: List of text strings to synthesize
+            language_id: Language code (e.g., 'en', 'de', 'fr')
+            audio_prompt_path: Optional path to reference audio for voice cloning
+            
+        Returns:
+            List of torch.Tensor, each containing generated audio waveform
+        """
+        if not texts:
+            raise ValueError("texts list cannot be empty")
+        
+        batch_size = len(texts)
+        
+        # Validate language_id
+        if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+            supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
+            raise ValueError(
+                f"Unsupported language_id '{language_id}'. "
+                f"Supported languages: {supported_langs}"
+            )
+        
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        # Update exaggeration if needed
+        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+            _cond: T3Cond = self.conds.t3
+            self.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
+            ).to(device=self.device)
+
+        # Batch tokenization with padding
+        normalized_texts = [punc_norm(t) for t in texts]
+        text_tokens, attention_mask = self.tokenizer.text_to_tokens_batch(
+            normalized_texts, 
+            language_id=language_id.lower() if language_id else None
+        )
+        text_tokens = text_tokens.to(self.device)
+
+        # Add SOT/EOT tokens
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+        # CFG: duplicate tokens
+        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+
+        with torch.inference_mode():
+            # T3 batch inference
+            speech_tokens = self.t3.inference_batch(
+                t3_cond=self.conds.t3,
+                text_tokens=text_tokens,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                max_cache_len=max_cache_len,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            )
+            
+            # S3Gen: Process each item sequentially (hybrid approach for stability)
+            results = []
+            for i in range(batch_size):
+                # Get speech tokens for this item and remove padding/invalid tokens
+                item_tokens = drop_invalid_tokens(speech_tokens[i])
+                item_tokens = item_tokens.to(self.device)
+                
+                # Generate audio
+                wav, _ = self.s3gen.inference(
+                    speech_tokens=item_tokens,
+                    ref_dict=self.conds.gen,
+                )
+                wav = wav.squeeze(0).detach().cpu().numpy()
+                watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+                results.append(torch.from_numpy(watermarked_wav).unsqueeze(0))
+            
+            return results
