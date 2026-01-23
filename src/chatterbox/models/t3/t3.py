@@ -905,16 +905,14 @@ def generate_t3_token_batch(
     i_expanded = i_tensor.expand(input_batch_size)
     generated_ids.scatter_(1, i_expanded.unsqueeze(1), next_token)
 
-    # Get embedding for the new tokens
+    # Get embedding for the new tokens - keep next_token as (batch, 1) for proper indexing
     position_embed = torch.index_select(position_embeds, 0, i_tensor).squeeze(0)  # (dim,)
-    next_token_embed = _speech_embedding_cache[next_token.squeeze(-1)] + position_embed  # (batch, dim)
+    # _speech_embedding_cache[next_token] with next_token shape (batch, 1) gives (batch, 1, dim)
+    next_token_embed = _speech_embedding_cache[next_token] + position_embed
 
-    # For CFG: duplicate embeddings
+    # For CFG: duplicate embeddings along batch dimension
     if cfg_weight > 0.0:
         next_token_embed = torch.cat([next_token_embed, next_token_embed], dim=0)
-
-    # Add sequence dimension: (effective_batch, 1, dim)
-    next_token_embed = next_token_embed.unsqueeze(1)
 
     return next_token, patched_model(
         inputs_embeds=next_token_embed,
