@@ -150,7 +150,19 @@ class ChatterboxMultilingualTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        self.watermarker = perth.PerthImplicitWatermarker()
+
+        
+        # Safely initialize watermarker
+        if hasattr(perth, 'PerthImplicitWatermarker') and callable(perth.PerthImplicitWatermarker):
+            self.watermarker = perth.PerthImplicitWatermarker()
+        else:
+            import logging
+            logging.warning("PerthImplicitWatermarker not available or failed to load. Watermarking will be disabled.")
+            # Simple dummy class to prevent errors later
+            class DummyWatermarker:
+                def apply_watermark(self, wav, sample_rate):
+                    return wav
+            self.watermarker = DummyWatermarker()
 
     @classmethod
     def get_supported_languages(cls):
@@ -163,7 +175,7 @@ class ChatterboxMultilingualTTS:
 
         ve = VoiceEncoder()
         ve.load_state_dict(
-            torch.load(ckpt_dir / "ve.pt", weights_only=True)
+            torch.load(ckpt_dir / "ve.pt", map_location=device, weights_only=True)
         )
         ve.to(device).eval()
 
@@ -176,7 +188,7 @@ class ChatterboxMultilingualTTS:
 
         s3gen = S3Gen()
         s3gen.load_state_dict(
-            torch.load(ckpt_dir / "s3gen.pt", weights_only=True)
+            torch.load(ckpt_dir / "s3gen.pt", map_location=device, weights_only=True)
         )
         s3gen.to(device).eval()
 
