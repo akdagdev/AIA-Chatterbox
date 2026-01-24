@@ -849,10 +849,6 @@ _generate_token_variants = {
     "inductor-strided": torch.compile(generate_t3_tokens_strided, backend="inductor", fullgraph=True, mode="max-autotune"),
 }
 
-_generate_token_batch_variants = {
-    "eager": generate_t3_token_batch,
-    "reduce-overhead": torch.compile(generate_t3_token_batch, mode="reduce-overhead"),
-}
 
 
 
@@ -932,3 +928,9 @@ def generate_t3_token_batch(
         cache_position=kv_cache.get_seq_length().unsqueeze(0),
         max_position=max_position,
     )
+
+_generate_token_batch_variants = {
+    "eager": generate_t3_token_batch,
+    "reduce-overhead": torch.compile(generate_t3_token_batch, mode="reduce-overhead"),
+}
+
