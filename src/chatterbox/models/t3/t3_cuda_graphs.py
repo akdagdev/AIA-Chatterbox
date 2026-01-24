@@ -343,6 +343,8 @@ class T3BatchStepCUDAGraphWrapper:
                 finished_mask,
                 max_position,
             )
+            # Copy static generated_ids back to original after first capture
+            generated_ids.copy_(static_tensors["generated_ids"])
         else:
             static_tensors = self._bucket_static_tensors[bucket_key]
             static_tensors["speech_embedding_cache"].copy_(speech_embedding_cache)
@@ -357,6 +359,9 @@ class T3BatchStepCUDAGraphWrapper:
             static_tensors["max_position"] = max_position
 
             self._bucket_graphs[bucket_key].replay()
+            
+            # Copy static generated_ids back to original after replay
+            generated_ids.copy_(static_tensors["generated_ids"])
 
         static_tensors = self._bucket_static_tensors[bucket_key]
         return (
