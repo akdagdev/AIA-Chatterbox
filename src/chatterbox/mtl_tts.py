@@ -2,10 +2,6 @@ from dataclasses import dataclass
 from typing import List, Union, Optional, Dict
 from pathlib import Path
 import os
-import logging
-import time
-
-logger = logging.getLogger(__name__)
 
 import librosa
 import torch
