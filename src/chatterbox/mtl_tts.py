@@ -597,62 +597,79 @@ class ChatterboxMultilingualTTS:
                 top_p=top_p,
             )
             
-            # S3Gen: Process items in parallel using multiple model copies + CUDA streams
-            # Each stream uses a different S3Gen copy to enable true parallelism
-            wav_futures = [None] * batch_size
+            # S3Gen: Process items in a single large batch (Tensor Batching)
+            # This enables saturating high-end GPUs like B200.
             
-            # Prepare tokens for each item
-            item_tokens_list = []
+            from torch.nn.utils.rnn import pad_sequence
+
+            # 1. Prepare speech tokens (pad to max length)
+            valid_tokens_list = []
+            valid_token_lens = []
             for i in range(batch_size):
-                item_tokens = drop_invalid_tokens(speech_tokens[i])
-                item_tokens = item_tokens.to(self.device)
-                item_tokens_list.append(item_tokens)
+                # drop_invalid_tokens returns 1D tensor [L]
+                # We interpret invalid tokens as "EOS" or similar logic
+                valid_t = drop_invalid_tokens(speech_tokens[i])
+                valid_tokens_list.append(valid_t)
+                valid_token_lens.append(len(valid_t))
             
-            is_cuda = torch.cuda.is_available() and (str(self.device) == 'cuda' or (isinstance(self.device, torch.device) and self.device.type == 'cuda'))
-
-            if is_cuda:
-                num_copies = len(self.s3gen_copies)
-                streams = [torch.cuda.Stream() for _ in range(num_copies)]
-                
-                # Launch S3Gen inferences in parallel using different model copies
-                # Use ThreadPoolExecutor to actully unblock the CPU/Python GIL between launches
-                import concurrent.futures
-                
-                def run_s3gen_inference(idx):
-                    copy_idx = idx % num_copies
-                    stream = streams[copy_idx]
-                    s3gen_copy = self.s3gen_copies[copy_idx]
-                    
-                    with torch.cuda.stream(stream):
-                        wav, _ = s3gen_copy.inference(
-                            speech_tokens=item_tokens_list[idx],
-                            ref_dict=item_ref_dicts[idx],
-                        )
-                    return idx, wav.squeeze(0)
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=num_copies) as executor:
-                    futures = [executor.submit(run_s3gen_inference, i) for i in range(batch_size)]
-                    for future in concurrent.futures.as_completed(futures):
-                        idx, res = future.result()
-                        wav_futures[idx] = res
-                
-                # Synchronize all streams
-                torch.cuda.synchronize()
-            else:
-                # Sequential execution for CPU/MPS
-                for i in range(batch_size):
-                    s3gen_copy = self.s3gen_copies[0]
-                    wav, _ = s3gen_copy.inference(
-                        speech_tokens=item_tokens_list[i],
-                        ref_dict=item_ref_dicts[i], # Use per-item ref_dict
-                    )
-                    wav_futures[i] = wav.squeeze(0)
+            # Create padded batch [B, T_max]
+            # Use 0 as pad value (masked out by flow model)
+            s3_input_tokens = pad_sequence(valid_tokens_list, batch_first=True, padding_value=0).to(self.device)
+            s3_token_lens = torch.tensor(valid_token_lens, dtype=torch.long, device=self.device)
             
-            # Post-process results (CPU-bound watermarking)
+            # 2. Collate reference dicts
+            # S3Gen has a static method collate_ref_dicts
+            collated_ref_dict = self.s3gen.collate_ref_dicts(item_ref_dicts, device=self.device)
+            
+            # 3. Batch Inference
+            # We use the primary S3Gen instance (no need for copies anymore)
+            wav_batch, _ = self.s3gen.inference(
+                speech_tokens=s3_input_tokens,
+                ref_dict=collated_ref_dict,
+                speech_token_lens=s3_token_lens
+            )
+            # wav_batch is [B, 1, T_wav_max] (padded/ragged output?)
+            # S3Gen.inference returns [B, 1, T_max] based on flow inference output.
+            # We need to slice each item to its valid length?
+            # flow.py inference (my modification) returns batch with max_len but zeros/garbage in padded area?
+            # watermarking/post-proc usually ignores padding if we just convert to numpy?
+            # But we should probably trim if we want exact results.
+            # For now, let's watermark the whole thing (fast) or just slice.
+            # Since S3Gen returns [B, 1, T], let's assume valid part is what we want.
+            # But actually flow inference returns [B, D, T]. HiFiGAN returns [B, 1, T_upsampled].
+            # The upsampled length depends on input len.
+            # T_wav = T_mel * 256. 
+            # We can calculate valid wav len from token len.
+            
+            # Post-process results
             results = []
             for i in range(batch_size):
-                wav = wav_futures[i].detach().cpu().numpy()
-                watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+                # Calculate valid wav length
+                # From flow.py logic: mel_len = token_len / 50 * 22050 / 256 ... rough approx
+                # Or just trust the silence/padding?
+                # Let's slice based on s3_token_lens to be clean.
+                # Mel len approx = token_len * token_mel_ratio (2?) ?
+                # S3Gen logic: token_len2 -> mel_len2 calculation.
+                # In flow.py: mel_len2 = (token_len2 / input_frame_rate * 22050 / 256)
+                # input_frame_rate=25. 22050/256 ~ 86.
+                # So wav_len ~ token_len / 25 * 22050 ~ token_len * 882.
+                # This is precise.
+                
+                valid_wav_len = int(valid_token_lens[i] / 25.0 * 22050.0)
+                # Actually HiFiGAN upsamples exactly.
+                # Current s3gen returns padded batch.
+                
+                # Careful: The raw wav tensor might be slightly larger due to padding structure.
+                # But cutting at valid_wav_len is safe.
+                
+                # wav_batch[i] is [1, T_max]
+                curr_wav = wav_batch[i, :, :valid_wav_len]
+                
+                wav_numpy = curr_wav.squeeze(0).detach().cpu().numpy()
+                watermarked_wav = self.watermarker.apply_watermark(wav_numpy, sample_rate=self.sr)
                 results.append(torch.from_numpy(watermarked_wav).unsqueeze(0))
+            
+            # Clear CUDA cache if needed (optional, maybe not for perf)
+            # torch.cuda.empty_cache()
             
             return results

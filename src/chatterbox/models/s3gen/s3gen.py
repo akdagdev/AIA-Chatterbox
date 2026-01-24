@@ -161,6 +161,70 @@ class S3Token2Mel(torch.nn.Module):
             embedding=ref_x_vector,
         )
 
+    @staticmethod
+    def collate_ref_dicts(ref_dicts: list, device="cpu"):
+        """
+        Collate a list of ref_dicts into a single batched ref_dict.
+        Handles padding for prompt_token and prompt_feat.
+        """
+        if not ref_dicts:
+            return None
+        
+        batch_size = len(ref_dicts)
+        
+        # 1. Stack embeddings (fixed size vector)
+        embedding = torch.cat([d['embedding'] for d in ref_dicts], dim=0).to(device)
+        
+        # 2. Pad and stack prompt_token
+        # prompt_token is [1, T]
+        prompt_tokens = [d['prompt_token'] for d in ref_dicts]
+        max_token_len = max([t.size(1) for t in prompt_tokens])
+        padded_tokens = []
+        prompt_token_lens = []
+        
+        for t in prompt_tokens:
+            curr_len = t.size(1)
+            prompt_token_lens.append(curr_len)
+            if curr_len < max_token_len:
+                # Pad with 0 (or specific pad token if needed, 0 is safe for S3)
+                t = F.pad(t, (0, max_token_len - curr_len), value=0)
+            padded_tokens.append(t)
+            
+        prompt_token = torch.cat(padded_tokens, dim=0).to(device)
+        prompt_token_len = torch.tensor(prompt_token_lens, dtype=torch.long, device=device)
+        
+        # 3. Pad and stack prompt_feat
+        # prompt_feat is [1, T, 80] or similar (B, T, D) -> actually (B, T, D) based on usage
+        # Let's check shape: ref_mels_24 is (1, T, 80)
+        prompt_feats = [d['prompt_feat'] for d in ref_dicts]
+        max_feat_len = max([f.size(1) for f in prompt_feats])
+        padded_feats = []
+        prompt_feat_lens = []
+        
+        for f in prompt_feats:
+            curr_len = f.size(1)
+            prompt_feat_lens.append(curr_len)
+            if curr_len < max_feat_len:
+                # Pad last dim (time) with 0
+                # F.pad signature for 3D (B, T, D): (pad_left, pad_right, pad_top, pad_bottom, ...)
+                # for (B, T, D), we want to pad dim 1 (T).
+                # Pytorch padding starts from last dim.
+                # last dim is D (no pad), 2nd last is T.
+                # pad format: (d_left, d_right, t_left, t_right)
+                f = F.pad(f, (0, 0, 0, max_feat_len - curr_len), value=0)
+            padded_feats.append(f)
+            
+        prompt_feat = torch.cat(padded_feats, dim=0).to(device)
+        prompt_feat_len = torch.tensor(prompt_feat_lens, dtype=torch.long, device=device)
+        
+        return dict(
+            prompt_token=prompt_token,
+            prompt_token_len=prompt_token_len,
+            prompt_feat=prompt_feat,
+            prompt_feat_len=prompt_feat_len,
+            embedding=embedding,
+        )
+
     def forward(
         self,
         speech_tokens: torch.LongTensor,
@@ -170,6 +234,7 @@ class S3Token2Mel(torch.nn.Module):
         # pre-computed ref embedding (prod API)
         ref_dict: Optional[dict] = None,
         finalize: bool = False,
+        speech_token_lens: Optional[torch.Tensor] = None,
     ):
         """
         Generate waveforms from S3 speech tokens and a reference waveform, which the speaker timbre is inferred from.
@@ -186,6 +251,7 @@ class S3Token2Mel(torch.nn.Module):
         - `ref_wav`: reference waveform (`torch.Tensor` with shape=[B=1, T])
         - `ref_sr`: reference sample rate
         - `finalize`: whether streaming is finished or not. Note that if False, the last 3 tokens will be ignored.
+        - `speech_token_lens`: optional tensor of lengths for `speech_tokens`. If not provided, full length is used.
         """
         assert (ref_wav is None) ^ (ref_dict is None), f"Must provide exactly one of ref_wav or ref_dict (got {ref_wav} and {ref_dict})"
 
@@ -206,8 +272,14 @@ class S3Token2Mel(torch.nn.Module):
         if len(speech_tokens.shape) == 1:
             speech_tokens = speech_tokens.unsqueeze(0)
 
-        # assert speech_tokens.shape[0] == 1, "only batch size of one allowed for now"
-        speech_token_lens = torch.LongTensor([speech_tokens.size(1)]).to(self.device)
+        # Batch size support
+        batch_size = speech_tokens.size(0)
+        
+        # Calculate lengths
+        if speech_token_lens is None:
+            speech_token_lens = torch.full((batch_size,), speech_tokens.size(1), dtype=torch.long, device=self.device)
+        else:
+            speech_token_lens = speech_token_lens.to(self.device)
 
         output_mels, _ = self.flow.inference(
             token=speech_tokens,
@@ -280,10 +352,12 @@ class S3Token2Wav(S3Token2Mel):
         # locally-computed ref embedding (mutex with ref_dict)
         ref_wav: Optional[torch.Tensor] = None,
         ref_sr: Optional[int] = None,
+        # pre-computed ref embedding (prod API)
         ref_dict: Optional[dict] = None,
         finalize: bool = False,
+        speech_token_lens: Optional[torch.Tensor] = None,
     ):
-        output_mels = super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize)
+        output_mels = super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize, speech_token_lens=speech_token_lens)
         return output_mels.to(self.dtype)
 
     @torch.inference_mode()
@@ -304,8 +378,9 @@ class S3Token2Wav(S3Token2Mel):
         cache_source: torch.Tensor = None, # NOTE: this arg is for streaming, it can probably be removed here
         finalize: bool = True,
         no_trim: bool = False,
+        speech_token_lens: Optional[torch.Tensor] = None,
     ):
-        output_mels = self.flow_inference(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize)
+        output_mels = self.flow_inference(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize, speech_token_lens=speech_token_lens)
         output_wavs, output_sources = self.hift_inference(output_mels, cache_source)
 
         # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
