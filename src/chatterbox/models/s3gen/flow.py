@@ -406,8 +406,6 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
 
         h = self.encoder_proj(h)
         
-        h = self.encoder_proj(h)
-        
         # Calculate expected mel lengths
         mel_len1 = prompt_feat_len # [B]
         
