@@ -186,7 +186,7 @@ class ChatterboxMultilingualTTS:
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
 
-        s3gen = S3Gen()
+        s3gen = S3Gen(compile_model=True)  # Enable torch.compile for flow + HiFTGenerator
         s3gen.load_state_dict(
             torch.load(ckpt_dir / "s3gen.pt", map_location=device, weights_only=True)
         )
