@@ -483,8 +483,11 @@ class ChatterboxMultilingualTTS:
             # Post-process results (CPU-bound watermarking)
             results = []
             for i in range(num_samples):
+                if wav_futures[i] is None:
+                    print(f"FATAL: wav_futures[{i}] is None!")
                 wav = wav_futures[i].detach().cpu().numpy()
                 watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
                 results.append(torch.from_numpy(watermarked_wav).unsqueeze(0))
             
+            # print(f"DEBUG: generate_batch returning {len(results)} items")
             return results
