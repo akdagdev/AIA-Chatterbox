@@ -406,48 +406,49 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
 
         h = self.encoder_proj(h)
         
+        h = self.encoder_proj(h)
+        
         # Calculate expected mel lengths
         mel_len1 = prompt_feat_len # [B]
-        mel_len2 = (token_len2.float() / self.input_frame_rate * 22050 / 256).long() # [B]
         
-        # Run Length Regulator (batched loop)
-        h_expanded_list = []
-        max_h_len = 0
-        actual_mel_lens = []
+        # UpsampleConformerEncoder returns upsampled lengths (total mel len)
+        total_mel_lens = h_lengths # [B]
         
-        for i in range(batch_size):
-            p_len = token_len1[i]
-            t_len = token_len2[i]
-            
-            # Slice valid text encoding
-            # h is [B, Total_Tok_Len, D]. 
-            # Prompt part is [0 : p_len]
-            # Text part is [p_len : p_len + t_len] (because we concated prompt+text tokens)
-            curr_h_prompt = h[i, :p_len].unsqueeze(0)
-            curr_h_text = h[i, p_len : p_len+t_len].unsqueeze(0)
-            
-            curr_mel_len1 = mel_len1[i].item()
-            curr_mel_len2 = mel_len2[i].item()
-            
-            curr_h_exp, _ = self.length_regulator.inference(
-                curr_h_prompt, 
-                curr_h_text, 
-                curr_mel_len1, 
-                curr_mel_len2, 
-                self.input_frame_rate
-            )
-            h_expanded_list.append(curr_h_exp.squeeze(0))
-            max_h_len = max(max_h_len, curr_h_exp.size(1))
-            actual_mel_lens.append(curr_h_exp.size(1))
+        # Handle lookahead trimming if not finalizing
+        if finalize is False:
+             # Trim global tensor
+             trim = self.pre_lookahead_len * self.token_mel_ratio
+             if h.size(1) > trim:
+                 h = h[:, :-trim]
+                 # Update valid lengths
+                 total_mel_lens = (total_mel_lens - trim).clamp(min=0)
+             else:
+                 # Edge case: sequence shorter than trim?
+                 h = torch.zeros_like(h[:, :0])
+                 total_mel_lens = torch.zeros_like(total_mel_lens)
+        
+        # Derived mel_len2 (generated length)
+        # Note: total_mel_lens includes prompt + generated.
+        mel_len2 = (total_mel_lens - mel_len1).clamp(min=0)
+        
+        max_mel_len = h.size(1)
 
-        # Stack back to batch [B, Max_Mel_Len, D]
-        h_mel = torch.zeros((batch_size, max_h_len, self.output_size), dtype=h.dtype, device=h.device)
-        for i, hh in enumerate(h_expanded_list):
-            h_mel[i, :hh.size(0)] = hh
+        # get conditions - batch-aware
+        # prompt_feat is [B, Max_P_Len, D]
+        conds = torch.zeros([batch_size, max_mel_len, self.output_size], device=token.device).to(h.dtype)
+        for i in range(batch_size):
+            p_len = mel_len1[i]
+            # Copy valid prompt feat
+            # Ensure p_len doesn't exceed prompt_feat actual size or max_mel_len
+            curr_p_len = min(p_len.item(), prompt_feat.size(1), max_mel_len)
+            conds[i, :curr_p_len] = prompt_feat[i, :curr_p_len]
             
-        # Update lens just in case LR changed something slightly
-        total_mel_lens = torch.tensor(actual_mel_lens, dtype=torch.long, device=token.device)
-        max_mel_len = max_h_len
+        conds = conds.transpose(1, 2)
+        
+        # Use h directly (it is already upsampled mel-domain features)
+        h_mel = h
+
+        mask = (~make_pad_mask(total_mel_lens)).to(h)
 
         # get conditions - batch-aware
         # prompt_feat is [B, Max_P_Len, D]
