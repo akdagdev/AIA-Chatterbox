@@ -192,12 +192,16 @@ class S3Token2Mel(torch.nn.Module):
         if ref_dict is None:
             ref_dict = self.embed_ref(ref_wav, ref_sr)
         else:
-            # type/device casting (all values will be numpy if it's from a prod API call)
+            # type/device/dtype casting (all values will be numpy if it's from a prod API call)
             for rk in list(ref_dict):
                 if isinstance(ref_dict[rk], np.ndarray):
                     ref_dict[rk] = torch.from_numpy(ref_dict[rk])
                 if torch.is_tensor(ref_dict[rk]):
-                    ref_dict[rk] = ref_dict[rk].to(self.device)
+                    # Cast to model device and dtype (supports FP16/FP32)
+                    if ref_dict[rk].is_floating_point():
+                        ref_dict[rk] = ref_dict[rk].to(device=self.device, dtype=self.dtype)
+                    else:
+                        ref_dict[rk] = ref_dict[rk].to(self.device)
 
         if len(speech_tokens.shape) == 1:
             speech_tokens = speech_tokens.unsqueeze(0)
