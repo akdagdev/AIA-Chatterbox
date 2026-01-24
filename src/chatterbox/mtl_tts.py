@@ -371,19 +371,17 @@ class ChatterboxMultilingualTTS:
                 emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
             ).to(device=self.device)
 
-        # Batch tokenization with padding
+        # Batch tokenization with padding - SOT/EOT added before padding for correct position
         normalized_texts = [punc_norm(t) for t in texts]
-        text_tokens, attention_mask = self.tokenizer.text_to_tokens_batch(
-            normalized_texts, 
-            language_id=language_id.lower() if language_id else None
-        )
-        text_tokens = text_tokens.to(self.device)
-
-        # Add SOT/EOT tokens
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token
-        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
-        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        text_tokens, attention_mask = self.tokenizer.text_to_tokens_batch(
+            normalized_texts, 
+            language_id=language_id.lower() if language_id else None,
+            sot_token=sot,
+            eot_token=eot
+        )
+        text_tokens = text_tokens.to(self.device)
 
         # CFG: duplicate tokens
         text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
@@ -402,21 +400,11 @@ class ChatterboxMultilingualTTS:
                 top_p=top_p,
             )
             
-            # DEBUG: Print token info
-            from chatterbox.models.s3tokenizer import EOS
-            print(f"[DEBUG] speech_tokens shape: {speech_tokens.shape}")
-            for i in range(min(3, speech_tokens.shape[0])):
-                tokens_i = speech_tokens[i]
-                eos_positions = (tokens_i == EOS).nonzero(as_tuple=True)[0]
-                print(f"[DEBUG] Item {i}: first 20 tokens = {tokens_i[:20].tolist()}")
-                print(f"[DEBUG] Item {i}: EOS positions = {eos_positions.tolist()[:5] if len(eos_positions) > 0 else 'NONE'}")
-            
             # S3Gen: Process each item sequentially (hybrid approach for stability)
             results = []
             for i in range(batch_size):
                 # Get speech tokens for this item and remove padding/invalid tokens
                 item_tokens = drop_invalid_tokens(speech_tokens[i])
-                print(f"[DEBUG] Item {i}: after drop_invalid_tokens length = {len(item_tokens)}")
                 item_tokens = item_tokens.to(self.device)
                 
                 # Generate audio

@@ -370,7 +370,9 @@ class MTLTokenizer:
         language_id: str = None,
         lowercase: bool = True,
         nfkd_normalize: bool = True,
-        pad_token_id: int = None
+        pad_token_id: int = None,
+        sot_token: int = None,
+        eot_token: int = None
     ) -> tuple:
         """
         Batch tokenization with padding and attention mask generation.
@@ -381,6 +383,8 @@ class MTLTokenizer:
             lowercase: Whether to lowercase the text
             nfkd_normalize: Whether to apply NFKD normalization
             pad_token_id: Token ID for padding. If None, uses [PAD] token or 0.
+            sot_token: Start-of-text token to prepend (optional)
+            eot_token: End-of-text token to append (optional)
         
         Returns:
             Tuple of (padded_tokens, attention_mask)
@@ -401,6 +405,14 @@ class MTLTokenizer:
             self.encode(text, language_id=language_id, lowercase=lowercase, nfkd_normalize=nfkd_normalize)
             for text in texts
         ]
+        
+        # Add SOT/EOT tokens to each list BEFORE padding
+        if sot_token is not None or eot_token is not None:
+            for i in range(len(token_lists)):
+                if sot_token is not None:
+                    token_lists[i] = [sot_token] + token_lists[i]
+                if eot_token is not None:
+                    token_lists[i] = token_lists[i] + [eot_token]
         
         # Find max length for padding
         max_len = max(len(tokens) for tokens in token_lists)
