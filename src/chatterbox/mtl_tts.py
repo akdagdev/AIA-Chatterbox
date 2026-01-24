@@ -425,8 +425,6 @@ class ChatterboxMultilingualTTS:
             
             # S3Gen: Process items in parallel using multiple model copies + CUDA streams
             # Each stream uses a different S3Gen copy to enable true parallelism
-            num_copies = len(self.s3gen_copies)
-            streams = [torch.cuda.Stream() for _ in range(num_copies)]
             wav_futures = [None] * batch_size
             
             # Prepare tokens for each item
@@ -436,21 +434,36 @@ class ChatterboxMultilingualTTS:
                 item_tokens = item_tokens.to(self.device)
                 item_tokens_list.append(item_tokens)
             
-            # Launch S3Gen inferences in parallel using different model copies
-            for i in range(batch_size):
-                copy_idx = i % num_copies
-                stream = streams[copy_idx]
-                s3gen_copy = self.s3gen_copies[copy_idx]
+            is_cuda = torch.cuda.is_available() and (str(self.device) == 'cuda' or (isinstance(self.device, torch.device) and self.device.type == 'cuda'))
+
+            if is_cuda:
+                num_copies = len(self.s3gen_copies)
+                streams = [torch.cuda.Stream() for _ in range(num_copies)]
                 
-                with torch.cuda.stream(stream):
+                # Launch S3Gen inferences in parallel using different model copies
+                for i in range(batch_size):
+                    copy_idx = i % num_copies
+                    stream = streams[copy_idx]
+                    s3gen_copy = self.s3gen_copies[copy_idx]
+                    
+                    with torch.cuda.stream(stream):
+                        wav, _ = s3gen_copy.inference(
+                            speech_tokens=item_tokens_list[i],
+                            ref_dict=self.conds.gen,
+                        )
+                        wav_futures[i] = wav.squeeze(0)
+                
+                # Synchronize all streams
+                torch.cuda.synchronize()
+            else:
+                # Sequential execution for CPU/MPS
+                for i in range(batch_size):
+                    s3gen_copy = self.s3gen_copies[0]
                     wav, _ = s3gen_copy.inference(
                         speech_tokens=item_tokens_list[i],
                         ref_dict=self.conds.gen,
                     )
                     wav_futures[i] = wav.squeeze(0)
-            
-            # Synchronize all streams
-            torch.cuda.synchronize()
             
             # Post-process results (CPU-bound watermarking)
             results = []

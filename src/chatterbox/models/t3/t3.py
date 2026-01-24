@@ -649,17 +649,8 @@ class T3(nn.Module):
             dtype=self.patched_model.dtype,
         )
 
-        # Pad for compilation stability
-        def pad_to_fixed_length(inputs_embeds: Tensor, limit: int):
-            pad_len = limit - inputs_embeds.shape[1]
-            if pad_len > 0:
-                pad_shape = list(inputs_embeds.shape)
-                pad_shape[1] = pad_len
-                pad = torch.zeros(pad_shape, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
-                return torch.cat([inputs_embeds, pad], dim=1)
-            return inputs_embeds
-
-        inputs_embeds = pad_to_fixed_length(inputs_embeds, TOKEN_LIMIT)
+        # No padding needed for eager inference or basic batching
+        # inputs_embeds = pad_to_fixed_length(inputs_embeds, TOKEN_LIMIT)
 
         # Initial forward pass
         cache_position = torch.arange(seq_len, device=device)
