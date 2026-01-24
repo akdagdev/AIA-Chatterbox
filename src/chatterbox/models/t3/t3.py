@@ -116,7 +116,11 @@ class T3(nn.Module):
         cond_emb = self.prepare_conditioning(t3_cond)  # (B, len_cond, dim)
         text_emb = self.text_emb(text_tokens)  # (B, len_text, dim)
         if cfg_weight > 0.0:
-            text_emb[1].zero_()  # CFG uncond
+            # Zero out the unconditioned half of the batch for CFG
+            # In batch mode: first half is conditioned, second half is unconditioned
+            batch_size = text_emb.size(0)
+            uncond_start = batch_size // 2
+            text_emb[uncond_start:].zero_()  # Zero entire unconditioned half
 
         speech_emb = self.speech_emb(speech_tokens)  # (B, len_speech, dim)
         if self.hp.input_pos_emb == "learned":
