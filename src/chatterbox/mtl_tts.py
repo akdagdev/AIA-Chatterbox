@@ -142,10 +142,12 @@ class ChatterboxMultilingualTTS:
         tokenizer: MTLTokenizer,
         device: str,
         conds: Conditionals = None,
+        s3gen_copies: list = None,  # Multiple S3Gen copies for parallel inference
     ):
         self.sr = S3GEN_SR  # sample rate of synthesized audio
         self.t3 = t3
         self.s3gen = s3gen
+        self.s3gen_copies = s3gen_copies if s3gen_copies else [s3gen]  # Use copies for parallel streams
         self.ve = ve
         self.tokenizer = tokenizer
         self.device = device
@@ -186,15 +188,20 @@ class ChatterboxMultilingualTTS:
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
 
-        s3gen = S3Gen()  # Create without compile
-        s3gen.load_state_dict(
-            torch.load(ckpt_dir / "s3gen.pt", map_location=device, weights_only=True)
-        )
-        s3gen.to(device).eval()
+        # Load checkpoint once
+        s3gen_state = torch.load(ckpt_dir / "s3gen.pt", map_location=device, weights_only=True)
         
-        # Compile flow and mel2wav for performance
-        s3gen.flow = torch.compile(s3gen.flow, mode="reduce-overhead")
-        s3gen.mel2wav = torch.compile(s3gen.mel2wav, mode="reduce-overhead")
+        # Create 4 S3Gen copies for parallel inference
+        NUM_S3GEN_COPIES = 4
+        s3gen_copies = []
+        for i in range(NUM_S3GEN_COPIES):
+            s3gen_copy = S3Gen()
+            s3gen_copy.load_state_dict(s3gen_state)
+            s3gen_copy.to(device).eval()
+            s3gen_copies.append(s3gen_copy)
+        
+        # Primary s3gen is the first copy
+        s3gen = s3gen_copies[0]
 
         tokenizer = MTLTokenizer(
             str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json")
@@ -204,7 +211,7 @@ class ChatterboxMultilingualTTS:
         if (builtin_voice := ckpt_dir / "conds.pt").exists():
             conds = Conditionals.load(builtin_voice).to(device)
 
-        return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
+        return cls(t3, s3gen, ve, tokenizer, device, conds=conds, s3gen_copies=s3gen_copies)
 
     @classmethod
     def from_pretrained(cls, device: torch.device) -> 'ChatterboxMultilingualTTS':
@@ -413,9 +420,10 @@ class ChatterboxMultilingualTTS:
                 top_p=top_p,
             )
             
-            # S3Gen: Process items in parallel using CUDA streams
-            # This allows multiple S3Gen inferences to run concurrently on the GPU
-            streams = [torch.cuda.Stream() for _ in range(batch_size)]
+            # S3Gen: Process items in parallel using multiple model copies + CUDA streams
+            # Each stream uses a different S3Gen copy to enable true parallelism
+            num_copies = len(self.s3gen_copies)
+            streams = [torch.cuda.Stream() for _ in range(num_copies)]
             wav_futures = [None] * batch_size
             
             # Prepare tokens for each item
@@ -425,10 +433,14 @@ class ChatterboxMultilingualTTS:
                 item_tokens = item_tokens.to(self.device)
                 item_tokens_list.append(item_tokens)
             
-            # Launch all S3Gen inferences in parallel streams
+            # Launch S3Gen inferences in parallel using different model copies
             for i in range(batch_size):
-                with torch.cuda.stream(streams[i]):
-                    wav, _ = self.s3gen.inference(
+                copy_idx = i % num_copies
+                stream = streams[copy_idx]
+                s3gen_copy = self.s3gen_copies[copy_idx]
+                
+                with torch.cuda.stream(stream):
+                    wav, _ = s3gen_copy.inference(
                         speech_tokens=item_tokens_list[i],
                         ref_dict=self.conds.gen,
                     )
