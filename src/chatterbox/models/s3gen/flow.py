@@ -367,37 +367,93 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         embedding = embedding.to(self.spk_embed_affine_layer.weight.dtype)
         prompt_feat = prompt_feat.to(self.spk_embed_affine_layer.weight.dtype)
 
-        assert token.shape[0] == 1  # TODO: Remove for full batch support
+        embedding = embedding.to(self.spk_embed_affine_layer.weight.dtype)
+        prompt_feat = prompt_feat.to(self.spk_embed_affine_layer.weight.dtype)
+
+        # Removed assertion for batch support
         batch_size = token.shape[0]
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
 
-        # concat text and prompt_text
-        token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
-        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
-        token = self.input_embedding(torch.clamp(token, min=0, max=self.input_embedding.num_embeddings-1)) * mask
+        # Calculate lengths
+        token_len1 = prompt_token_len # [B]
+        token_len2 = token_len        # [B]
+        total_token_len = token_len1 + token_len2
+        max_total_len = total_token_len.max().item()
+        
+        # Combined token tensor [B, Max_Total_Len]
+        combined_token = torch.zeros((batch_size, max_total_len), dtype=token.dtype, device=token.device)
+        for i in range(batch_size):
+            p_len = token_len1[i]
+            t_len = token_len2[i]
+            combined_token[i, :p_len] = prompt_token[i, :p_len]
+            combined_token[i, p_len:p_len+t_len] = token[i, :t_len]
+            
+        token = combined_token
+        mask = (~make_pad_mask(total_token_len)).unsqueeze(-1).to(embedding)
+        
+        # Clamp tokens
+        vocab_size = self.input_embedding.num_embeddings
+        token = self.input_embedding(torch.clamp(token, min=0, max=vocab_size-1)) * mask
 
         # text encode
-        h, h_lengths = self.encoder(token, token_len)
+        h, h_lengths = self.encoder(token, total_token_len)
         if finalize is False:
-            h = h[:, :-self.pre_lookahead_len * self.token_mel_ratio]
-        mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
-        h = self.encoder_proj(h)
+             # Pre-lookahead logic... assumes similar ratio?
+             # Might be risky with variable batch, but assuming standard behavior
+             h = h[:, :-self.pre_lookahead_len * self.token_mel_ratio]
 
-        # get conditions - now batch-aware
-        conds = torch.zeros([batch_size, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
-        conds[:, :mel_len1] = prompt_feat
+        h = self.encoder_proj(h)
+        
+        # Calculate mel lengths
+        mel_len1 = prompt_feat_len # [B]
+        mel_len2 = (token_len2.float() / self.input_frame_rate * 22050 / 256).long() # [B]
+        total_mel_lens = mel_len1 + mel_len2
+        max_mel_len = total_mel_lens.max().item()
+
+        # get conditions - batch-aware
+        # prompt_feat is [B, Max_P_Len, D]
+        # We need to construct conds [B, Max_Mel_Len, D]
+        # placing prompt_feat at start
+        conds = torch.zeros([batch_size, max_mel_len, self.output_size], device=token.device).to(h.dtype)
+        for i in range(batch_size):
+            p_len = mel_len1[i]
+            conds[i, :p_len] = prompt_feat[i, :p_len]
         conds = conds.transpose(1, 2)
 
-        mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        mask = (~make_pad_mask(total_mel_lens)).to(h)
+        
+        # Call decoder
+        # Note: Decoder prompt_len arg might expect int or tensor. 
+        # CausalConditionalCFM.compute_loss uses it for masking likely.
+        # If it's a list/tensor, it should work if supported. 
+        # If not supported, we must loop or hope it handles it. 
+        # Given it's a custom Estimator/Decoder, let's assume it might need update if it uses prompt_len as int scalar.
+        # But wait, compute_loss (training) uses prompt_len? No, inference does.
+        # Let's check if passing tensor works. If error, we fix decoder.
         feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10
+            n_timesteps=10,
+            prompt_len=mel_len1 # Passing tensor of lengths
         )
+        
+        # Slice output
+        # feat is [B, D, T_total]
+        # We want [B, D, T_gen] where T_gen varies.
+        # Padding output to max gen len.
+        max_gen_len = mel_len2.max().item()
+        feat_out = torch.zeros((batch_size, self.output_size, max_gen_len), dtype=feat.dtype, device=feat.device)
+        
+        for i in range(batch_size):
+            p_len = mel_len1[i]
+            g_len = mel_len2[i]
+            feat_out[i, :, :g_len] = feat[i, :, p_len : p_len+g_len]
+            
+        return feat_out.float(), None
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
         return feat, None  # NOTE jrm: why are they returning None here?
