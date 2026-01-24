@@ -280,11 +280,11 @@ class S3Token2Wav(S3Token2Mel):
         # locally-computed ref embedding (mutex with ref_dict)
         ref_wav: Optional[torch.Tensor] = None,
         ref_sr: Optional[int] = None,
-        # pre-computed ref embedding (prod API)
         ref_dict: Optional[dict] = None,
         finalize: bool = False,
     ):
-        return super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize)
+        output_mels = super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize)
+        return output_mels.to(self.dtype)
 
     @torch.inference_mode()
     def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):
