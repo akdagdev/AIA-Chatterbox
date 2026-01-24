@@ -416,6 +416,7 @@ class HiFTGenerator(nn.Module):
     def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
         s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
         s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+        s_stft = s_stft.to(x.dtype) # Cast to match model precision (FP16)
 
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
