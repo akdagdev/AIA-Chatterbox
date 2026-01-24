@@ -58,10 +58,10 @@ def benchmark():
 
     # Use pre-computed embeddings in requests
     requests = [
-        SpeechRequest(text="Hello, how are you?", language_id="en", conditionals=embedding_cache.get("referencebill.mp3")),
-        SpeechRequest(text="Merhaba, nasılsın?", language_id="tr", conditionals=embedding_cache.get("referencekim.wav")),
-        SpeechRequest(text="Hola, ¿cómo estás?", language_id="es", conditionals=embedding_cache.get("referencebill.mp3")),
-        SpeechRequest(text="Bonjour, comment allez-vous?", language_id="fr", conditionals=embedding_cache.get("referencekim.wav")),
+        SpeechRequest(text="Hello, how are you? Hello, how are you? Hello, how are you?", language_id="en", conditionals=embedding_cache.get("referencebill.mp3")),
+        SpeechRequest(text="Merhaba, nasılsın? Merhaba, nasılsın? Merhaba, nasılsın?", language_id="tr", conditionals=embedding_cache.get("referencekim.wav")),
+        SpeechRequest(text="Hola, ¿cómo estás? Hola, ¿cómo estás?", language_id="es", conditionals=embedding_cache.get("referencebill.mp3")),
+        SpeechRequest(text="Bonjour, comment allez-vous? Bonjour, comment allez-vous?", language_id="fr", conditionals=embedding_cache.get("referencekim.wav")),
     ]
 
     requests = requests * 4
@@ -104,15 +104,7 @@ def benchmark():
     def make_timed_s3gen_inference(original_method):
         def timed_s3gen_inference(*args, **kwargs):
             start = time.time()
-            if device == "cuda":
-                # Note: excessive sync inside threads might impact perf slightly, 
-                # but we need it for accurate component timing.
-                # In threaded execution, this global sync might be noisy.
-                # For now, we trust the relative buckets.
-                torch.cuda.synchronize()
             result = original_method(*args, **kwargs)
-            if device == "cuda":
-                torch.cuda.synchronize()
             s3gen_times.append(time.time() - start)
             return result
         return timed_s3gen_inference

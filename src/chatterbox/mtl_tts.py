@@ -615,17 +615,26 @@ class ChatterboxMultilingualTTS:
                 streams = [torch.cuda.Stream() for _ in range(num_copies)]
                 
                 # Launch S3Gen inferences in parallel using different model copies
-                for i in range(batch_size):
-                    copy_idx = i % num_copies
+                # Use ThreadPoolExecutor to actully unblock the CPU/Python GIL between launches
+                import concurrent.futures
+                
+                def run_s3gen_inference(idx):
+                    copy_idx = idx % num_copies
                     stream = streams[copy_idx]
                     s3gen_copy = self.s3gen_copies[copy_idx]
                     
                     with torch.cuda.stream(stream):
                         wav, _ = s3gen_copy.inference(
-                            speech_tokens=item_tokens_list[i],
-                            ref_dict=item_ref_dicts[i], # Use per-item ref_dict
+                            speech_tokens=item_tokens_list[idx],
+                            ref_dict=item_ref_dicts[idx],
                         )
-                        wav_futures[i] = wav.squeeze(0)
+                    return idx, wav.squeeze(0)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=num_copies) as executor:
+                    futures = [executor.submit(run_s3gen_inference, i) for i in range(batch_size)]
+                    for future in concurrent.futures.as_completed(futures):
+                        idx, res = future.result()
+                        wav_futures[idx] = res
                 
                 # Synchronize all streams
                 torch.cuda.synchronize()
