@@ -548,11 +548,9 @@ class ChatterboxMultilingualTTS:
             text_tokens
         )
 
-        # CFG: duplicate tokens
-        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
-        
-        # CFG: duplicate T3Cond components to match doubled text_tokens
+        # CFG: duplicate tokens and T3Cond only when CFG is enabled
         if cfg_weight > 0:
+            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
             cfg_t3_cond = T3Cond(
                 speaker_emb=torch.cat([t3_cond_to_use.speaker_emb, t3_cond_to_use.speaker_emb], dim=0),
                 cond_prompt_speech_tokens=torch.cat([t3_cond_to_use.cond_prompt_speech_tokens, t3_cond_to_use.cond_prompt_speech_tokens], dim=0) if t3_cond_to_use.cond_prompt_speech_tokens is not None else None,
