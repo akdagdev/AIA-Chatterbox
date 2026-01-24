@@ -187,6 +187,9 @@ class ChatterboxMultilingualTTS:
             t3_state = t3_state["model"][0]
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
+        
+        # Optimize T3
+        t3 = torch.compile(t3, mode="reduce-overhead")
 
         # Load checkpoint once
         s3gen_state = torch.load(ckpt_dir / "s3gen.pt", map_location=device, weights_only=True)
