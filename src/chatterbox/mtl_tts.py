@@ -198,8 +198,12 @@ class ChatterboxMultilingualTTS:
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
         
-        # Optimize T3
-        t3 = torch.compile(t3, mode="reduce-overhead")
+        # Optimize T3 (Compilation)
+        # We compile the internal transformer model to reduce memory overhead and latency
+        # mode="reduce-overhead" uses CUDA Graphs for kernel execution
+        if hasattr(torch, "compile"):
+             logger.info("Compiling T3 model with torch.compile...")
+             t3.tfmr = torch.compile(t3.tfmr, mode="reduce-overhead")
 
         # Load checkpoint once
         s3gen_state = torch.load(ckpt_dir / "s3gen.pt", map_location=device, weights_only=True)
