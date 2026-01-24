@@ -666,10 +666,14 @@ class T3(nn.Module):
         indices = torch.arange(1, max_new_tokens + 1, device=device)
         batch_idx = torch.arange(input_batch_size, dtype=torch.long, device=device)
 
+        # Select generation backend
+        backend = "reduce-overhead" if device.type == "cuda" else "eager"
+        generate_token_batch = _generate_token_batch_variants.get(backend, _generate_token_batch_variants["eager"])
+
         for i in tqdm(range(max_new_tokens), desc="Batch Sampling", dynamic_ncols=True):
             i_tensor = indices[i]
 
-            next_token, output_logits = generate_t3_token_batch(
+            next_token, output_logits = generate_token_batch(
                 self._speech_embedding_cache,
                 output_logits,
                 i_tensor,
@@ -844,6 +848,12 @@ _generate_token_variants = {
     "cudagraphs-strided": torch.compile(generate_t3_tokens_strided, backend="cudagraphs", fullgraph=True),
     "inductor-strided": torch.compile(generate_t3_tokens_strided, backend="inductor", fullgraph=True, mode="max-autotune"),
 }
+
+_generate_token_batch_variants = {
+    "eager": generate_t3_token_batch,
+    "reduce-overhead": torch.compile(generate_t3_token_batch, mode="reduce-overhead"),
+}
+
 
 
 def generate_t3_token_batch(
