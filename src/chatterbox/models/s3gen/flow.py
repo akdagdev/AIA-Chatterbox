@@ -425,20 +425,20 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         mask = (~make_pad_mask(total_mel_lens)).to(h)
         
         # Call decoder
-        # Note: Decoder prompt_len arg might expect int or tensor. 
-        # CausalConditionalCFM.compute_loss uses it for masking likely.
-        # If it's a list/tensor, it should work if supported. 
-        # If not supported, we must loop or hope it handles it. 
-        # Given it's a custom Estimator/Decoder, let's assume it might need update if it uses prompt_len as int scalar.
-        # But wait, compute_loss (training) uses prompt_len? No, inference does.
-        # Let's check if passing tensor works. If error, we fix decoder.
+        # CausalConditionalCFM.forward does not accept prompt_len or flow_cache
+        # It relies on 'cond' to provide prompt information (in-painting happens via cond?)
+        # Actually, looking at CausalConditionalCFM implementation:
+        # It generates z from rand_noise. 
+        # It does NOT preserve prompt explicitly like ConditionalCFM does with flow_cache.
+        # It assumes the task is to generate the target mel given the condition.
+        # Since 'cond' contains the prompt frames aligned at the start, the model
+        # should learn to copy them or extend them.
         feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10,
-            prompt_len=mel_len1 # Passing tensor of lengths
+            n_timesteps=10
         )
         
         # Slice output
