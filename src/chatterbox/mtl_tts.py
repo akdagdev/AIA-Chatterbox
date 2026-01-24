@@ -413,19 +413,34 @@ class ChatterboxMultilingualTTS:
                 top_p=top_p,
             )
             
-            # S3Gen: Process each item sequentially (hybrid approach for stability)
-            results = []
+            # S3Gen: Process items in parallel using CUDA streams
+            # This allows multiple S3Gen inferences to run concurrently on the GPU
+            streams = [torch.cuda.Stream() for _ in range(batch_size)]
+            wav_futures = [None] * batch_size
+            
+            # Prepare tokens for each item
+            item_tokens_list = []
             for i in range(batch_size):
-                # Get speech tokens for this item and remove padding/invalid tokens
                 item_tokens = drop_invalid_tokens(speech_tokens[i])
                 item_tokens = item_tokens.to(self.device)
-                
-                # Generate audio
-                wav, _ = self.s3gen.inference(
-                    speech_tokens=item_tokens,
-                    ref_dict=self.conds.gen,
-                )
-                wav = wav.squeeze(0).detach().cpu().numpy()
+                item_tokens_list.append(item_tokens)
+            
+            # Launch all S3Gen inferences in parallel streams
+            for i in range(batch_size):
+                with torch.cuda.stream(streams[i]):
+                    wav, _ = self.s3gen.inference(
+                        speech_tokens=item_tokens_list[i],
+                        ref_dict=self.conds.gen,
+                    )
+                    wav_futures[i] = wav.squeeze(0)
+            
+            # Synchronize all streams
+            torch.cuda.synchronize()
+            
+            # Post-process results (CPU-bound watermarking)
+            results = []
+            for i in range(batch_size):
+                wav = wav_futures[i].detach().cpu().numpy()
                 watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
                 results.append(torch.from_numpy(watermarked_wav).unsqueeze(0))
             
