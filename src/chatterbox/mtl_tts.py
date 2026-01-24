@@ -382,6 +382,15 @@ class ChatterboxMultilingualTTS:
             eot_token=eot
         )
         text_tokens = text_tokens.to(self.device)
+        
+        # Replace PAD tokens with EOT to prevent model confusion
+        # PAD token is typically 0 or vocab["[PAD]"]
+        pad_token_id = 0  # Default PAD token
+        text_tokens = torch.where(
+            attention_mask.to(self.device) == 0,
+            torch.tensor(eot, device=self.device),
+            text_tokens
+        )
 
         # CFG: duplicate tokens
         text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
