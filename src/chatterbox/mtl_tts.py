@@ -395,6 +395,10 @@ class ChatterboxMultilingualTTS:
         num_samples = len(texts)
         micro_batches = []
         
+        # Define tokens
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        
         # Prepare all inputs for T3 first (tokenization is fast enough)
         for i in range(0, num_samples, MB_SIZE):
             chunk_texts = texts[i : min(i + MB_SIZE, num_samples)]
