@@ -131,10 +131,12 @@ class Conditionals:
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
 @dataclass
+@dataclass
 class SpeechRequest:
     text: str
     audio_prompt_path: Optional[str] = None
     language_id: Optional[str] = None
+    conditionals: Optional[Conditionals] = None
 
 
 class ChatterboxMultilingualTTS:
@@ -236,7 +238,7 @@ class ChatterboxMultilingualTTS:
         )
         return cls.from_local(ckpt_dir, device)
     
-    def _get_conditioning_for_prompt(self, wav_fpath, exaggeration=0.5):
+    def get_conditioning_for_prompt(self, wav_fpath, exaggeration=0.5):
         """
         Extract conditioning data (T3Cond and S3Gen ref_dict) from an audio file.
         Returns:
@@ -271,7 +273,7 @@ class ChatterboxMultilingualTTS:
         return t3_cond, s3gen_ref_dict
 
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
-        t3_cond, s3gen_ref_dict = self._get_conditioning_for_prompt(wav_fpath, exaggeration)
+        t3_cond, s3gen_ref_dict = self.get_conditioning_for_prompt(wav_fpath, exaggeration)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
     def generate(
@@ -429,28 +431,40 @@ class ChatterboxMultilingualTTS:
         # Optimization: check if all prompt paths are None or same string?
         # For simplicity and correctness with the new Struct design, let's process each one.
         
-        # But wait, if they are all None (default), we shouldn't re-compute if self.conds exists.
-        # Let's check if ANY request has a specific prompt path.
-        has_custom_prompts = any(r.audio_prompt_path is not None for r in input_requests)
-        
-        if has_custom_prompts:
+        if has_custom_prompts or any(r.conditionals is not None for r in input_requests):
             # Multi-speaker batching (or explicitly specified single speaker)
             t3_cond_list = []
+            
+            # Simple cache for path-based prompts within this batch
+            prompt_cache = {} 
+
             for req in input_requests:
                 prompt_path = req.audio_prompt_path
                 current_exaggeration = exaggeration # Support per-request exaggeration? For now global.
                 
-                if prompt_path:
-                    t3_c, s3_d = self._get_conditioning_for_prompt(prompt_path, current_exaggeration)
+                t3_c = None
+                s3_d = None
+                
+                # Priority 1: Pre-computed conditionals
+                if req.conditionals:
+                    t3_c = req.conditionals.t3
+                    s3_d = req.conditionals.gen
+                
+                # Priority 2: Audio path (compute or cache)
+                elif prompt_path:
+                    if prompt_path in prompt_cache:
+                        t3_c, s3_d = prompt_cache[prompt_path]
+                    else:
+                        t3_c, s3_d = self.get_conditioning_for_prompt(prompt_path, current_exaggeration)
+                        prompt_cache[prompt_path] = (t3_c, s3_d)
+                
+                # Priority 3: Fallback to global defaults
                 else:
-                    # Fallback to existing prompts if set? Or error?
-                    # If mixed (some have prompt, some don't), we probably want to use 'default' voice for None.
-                    # Assuming self.conds is available used for defaults.
                     if hasattr(self, 'conds') and self.conds:
                         t3_c = self.conds.t3
                         s3_d = self.conds.gen
                     else:
-                        raise ValueError("Some requests missing audio_prompt_path and no default voice loaded.")
+                        raise ValueError("Some requests missing audio_prompt_path/conditionals and no default voice loaded.")
 
                 t3_cond_list.append(t3_c)
                 item_ref_dicts.append(s3_d)

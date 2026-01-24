@@ -32,11 +32,36 @@ def benchmark():
     
     # Test texts with mixed languages and prompts
     # Note: ensure benchmark_output/output_0.wav etc exist or use None
+    # Pre-compute conditioning for reference files (Simulate "Production" environment)
+    print("\nPre-computing embeddings for reference files...")
+    
+    # Define reference files to use
+    ref_files = [
+        "referencebill.mp3",
+        "referencekim.wav"
+    ]
+    
+    # Store computed conditionals
+    embedding_cache = {}
+    
+    for ref_file in ref_files:
+        if Path(ref_file).exists():
+            print(f"Computing embedding for {ref_file}...")
+            # Compute once
+            conds_tuple = model.get_conditioning_for_prompt(ref_file)
+            # Create Conditionals object
+            from chatterbox.mtl_tts import Conditionals
+            embedding_cache[ref_file] = Conditionals(*conds_tuple)
+        else:
+            print(f"Warning: Reference file {ref_file} not found. Using None.")
+            embedding_cache[ref_file] = None
+
+    # Use pre-computed embeddings in requests
     requests = [
-        SpeechRequest(text="Hello, how are you?", language_id="en", audio_prompt_path="referencebill.mp3"),
-        SpeechRequest(text="Merhaba, nasılsın?", language_id="tr", audio_prompt_path="referencekim.wav"),
-        SpeechRequest(text="Hola, ¿cómo estás?", language_id="es", audio_prompt_path="referencebill.mp3"),
-        SpeechRequest(text="Bonjour, comment allez-vous?", language_id="fr", audio_prompt_path="referencekim.wav"),
+        SpeechRequest(text="Hello, how are you?", language_id="en", conditionals=embedding_cache.get("referencebill.mp3")),
+        SpeechRequest(text="Merhaba, nasılsın?", language_id="tr", conditionals=embedding_cache.get("referencekim.wav")),
+        SpeechRequest(text="Hola, ¿cómo estás?", language_id="es", conditionals=embedding_cache.get("referencebill.mp3")),
+        SpeechRequest(text="Bonjour, comment allez-vous?", language_id="fr", conditionals=embedding_cache.get("referencekim.wav")),
     ]
 
     requests = requests * 4
