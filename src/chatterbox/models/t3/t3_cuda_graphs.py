@@ -324,6 +324,7 @@ class T3BatchStepCUDAGraphWrapper:
         input_batch_size: int = 1,
         finished_mask: torch.Tensor = None,
         stop_token_id: int = None,
+        stop_token_tensor: torch.Tensor = None,
         max_position: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bucket_key = max_position or TOKEN_LIMIT
