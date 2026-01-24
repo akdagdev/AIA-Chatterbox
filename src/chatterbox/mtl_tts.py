@@ -402,11 +402,21 @@ class ChatterboxMultilingualTTS:
                 top_p=top_p,
             )
             
+            # DEBUG: Print token info
+            from chatterbox.models.s3tokenizer import EOS
+            print(f"[DEBUG] speech_tokens shape: {speech_tokens.shape}")
+            for i in range(min(3, speech_tokens.shape[0])):
+                tokens_i = speech_tokens[i]
+                eos_positions = (tokens_i == EOS).nonzero(as_tuple=True)[0]
+                print(f"[DEBUG] Item {i}: first 20 tokens = {tokens_i[:20].tolist()}")
+                print(f"[DEBUG] Item {i}: EOS positions = {eos_positions.tolist()[:5] if len(eos_positions) > 0 else 'NONE'}")
+            
             # S3Gen: Process each item sequentially (hybrid approach for stability)
             results = []
             for i in range(batch_size):
                 # Get speech tokens for this item and remove padding/invalid tokens
                 item_tokens = drop_invalid_tokens(speech_tokens[i])
+                print(f"[DEBUG] Item {i}: after drop_invalid_tokens length = {len(item_tokens)}")
                 item_tokens = item_tokens.to(self.device)
                 
                 # Generate audio
