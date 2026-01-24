@@ -186,11 +186,15 @@ class ChatterboxMultilingualTTS:
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
 
-        s3gen = S3Gen(compile_model=True)  # Enable torch.compile for flow + HiFTGenerator
+        s3gen = S3Gen()  # Create without compile
         s3gen.load_state_dict(
             torch.load(ckpt_dir / "s3gen.pt", map_location=device, weights_only=True)
         )
         s3gen.to(device).eval()
+        
+        # Compile flow and mel2wav for performance
+        s3gen.flow = torch.compile(s3gen.flow, mode="reduce-overhead")
+        s3gen.mel2wav = torch.compile(s3gen.mel2wav, mode="reduce-overhead")
 
         tokenizer = MTLTokenizer(
             str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json")
