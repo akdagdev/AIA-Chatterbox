@@ -385,76 +385,104 @@ class ChatterboxMultilingualTTS:
                 emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
             ).to(device=self.device)
 
-        # Batch tokenization with padding - SOT/EOT added before padding for correct position
-        normalized_texts = [punc_norm(t) for t in texts]
-        sot = self.t3.hp.start_text_token
-        eot = self.t3.hp.stop_text_token
-        text_tokens, attention_mask = self.tokenizer.text_to_tokens_batch(
-            normalized_texts, 
-            language_id=language_id.lower() if language_id else None,
-            sot_token=sot,
-            eot_token=eot
-        )
-        text_tokens = text_tokens.to(self.device)
-        
-        # Replace PAD tokens with EOT to prevent model confusion
-        # PAD token is typically 0 or vocab["[PAD]"]
-        pad_token_id = 0  # Default PAD token
-        text_tokens = torch.where(
-            attention_mask.to(self.device) == 0,
-            torch.tensor(eot, device=self.device),
-            text_tokens
-        )
-
-        # CFG: duplicate tokens
-        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
-
-        with torch.inference_mode():
-            # T3 batch inference
-            speech_tokens = self.t3.inference_batch(
-                t3_cond=self.conds.t3,
-                text_tokens=text_tokens,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-                max_cache_len=max_cache_len,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
-            )
+            # === Pipelined Micro-Batch Execution ===
+            # We process the input batch in chunks (micro-batches).
+            # While S3Gen is processing chunk N, T3 starts generating tokens for chunk N+1.
+            # This overlaps the execution of T3 and S3Gen for better throughput.
             
-            # S3Gen: Process items in parallel using multiple model copies + CUDA streams
-            # Each stream uses a different S3Gen copy to enable true parallelism
-            num_copies = len(self.s3gen_copies)
-            streams = [torch.cuda.Stream() for _ in range(num_copies)]
-            wav_futures = [None] * batch_size
+            # Default micro-batch size (can be tuned)
+            MB_SIZE = 8
+            num_samples = len(texts)
+            micro_batches = []
             
-            # Prepare tokens for each item
-            item_tokens_list = []
-            for i in range(batch_size):
-                item_tokens = drop_invalid_tokens(speech_tokens[i])
-                item_tokens = item_tokens.to(self.device)
-                item_tokens_list.append(item_tokens)
-            
-            # Launch S3Gen inferences in parallel using different model copies
-            for i in range(batch_size):
-                copy_idx = i % num_copies
-                stream = streams[copy_idx]
-                s3gen_copy = self.s3gen_copies[copy_idx]
+            # Prepare all inputs for T3 first (tokenization is fast enough)
+            for i in range(0, num_samples, MB_SIZE):
+                chunk_texts = texts[i : min(i + MB_SIZE, num_samples)]
+                chunk_indices = range(i, min(i + MB_SIZE, num_samples))
                 
-                with torch.cuda.stream(stream):
-                    wav, _ = s3gen_copy.inference(
-                        speech_tokens=item_tokens_list[i],
-                        ref_dict=self.conds.gen,
-                    )
-                    wav_futures[i] = wav.squeeze(0)
+                # Tokenize chunk
+                chunk_normalized = [punc_norm(t) for t in chunk_texts]
+                chunk_tokens, chunk_mask = self.tokenizer.text_to_tokens_batch(
+                    chunk_normalized, 
+                    language_id=language_id.lower() if language_id else None,
+                    sot_token=sot,
+                    eot_token=eot
+                )
+                chunk_tokens = chunk_tokens.to(self.device)
+                
+                # Replace PAD with EOT
+                chunk_tokens = torch.where(
+                    chunk_mask.to(self.device) == 0,
+                    torch.tensor(eot, device=self.device),
+                    chunk_tokens
+                )
+                
+                # CFG expansion
+                chunk_tokens = torch.cat([chunk_tokens, chunk_tokens], dim=0)
+                
+                micro_batches.append({
+                    "indices": chunk_indices,
+                    "text_tokens": chunk_tokens
+                })
+
+            wav_futures = [None] * num_samples
             
-            # Synchronize all streams
+            # S3Gen streams for parallelism
+            num_copies = len(self.s3gen_copies)
+            s3gen_streams = [torch.cuda.Stream() for _ in range(num_copies)]
+
+            # Helper to launch S3Gen async
+            def launch_s3gen_async(mb_idx, speech_tokens_batch):
+                mb_indices = micro_batches[mb_idx]["indices"]
+                batch_len = len(mb_indices)
+                
+                for i in range(batch_len):
+                    global_idx = mb_indices[i]
+                    copy_idx = global_idx % num_copies
+                    stream = s3gen_streams[copy_idx]
+                    s3gen_copy = self.s3gen_copies[copy_idx]
+                    
+                    # Prepare tokens
+                    item_tokens = drop_invalid_tokens(speech_tokens_batch[i])
+                    item_tokens = item_tokens.to(self.device)
+                    
+                    with torch.cuda.stream(stream):
+                        wav, _ = s3gen_copy.inference(
+                            speech_tokens=item_tokens,
+                            ref_dict=self.conds.gen,
+                        )
+                        # wav_futures stores the tensor on GPU. We should NOT sync here.
+                        wav_futures[global_idx] = wav.squeeze(0)
+
+            # Pipeline Loop
+            # T3 is synchronous in the main stream (default stream)
+            # S3Gen runs in separate streams
+            
+            for i, mb in enumerate(micro_batches):
+                # 1. Run T3 for current micro-batch (Synchronizes implicitely with previous ops on default stream)
+                # But S3Gen from previous MB runs in separate streams, so T3 runs in parallel with S3Gen(i-1)
+                
+                batch_speech_tokens = self.t3.inference_batch(
+                    t3_cond=self.conds.t3,
+                    text_tokens=mb["text_tokens"],
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    cfg_weight=cfg_weight,
+                    max_cache_len=max_cache_len,
+                    repetition_penalty=repetition_penalty,
+                    min_p=min_p,
+                    top_p=top_p,
+                )
+                
+                # 2. Launch S3Gen for this T3 output (Async)
+                launch_s3gen_async(i, batch_speech_tokens)
+            
+            # Synchronize all streams at the very end
             torch.cuda.synchronize()
             
             # Post-process results (CPU-bound watermarking)
             results = []
-            for i in range(batch_size):
+            for i in range(num_samples):
                 wav = wav_futures[i].detach().cpu().numpy()
                 watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
                 results.append(torch.from_numpy(watermarked_wav).unsqueeze(0))

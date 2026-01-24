@@ -42,9 +42,9 @@ def benchmark():
     batch_size = len(texts)
     print(f"\nBenchmarking with batch size: {batch_size}")
     
-    # Warmup
+    # Warmup (ensure all S3Gen copies are initialized)
     print("Warming up...")
-    model.generate_batch(texts[:2], language_id="en", max_new_tokens=50, cfg_weight=0)
+    model.generate_batch(texts[:4], language_id="en", max_new_tokens=50, cfg_weight=0)
     
     # Run Benchmark with detailed timing
     print("\nStarting generation with profiling...")
@@ -87,7 +87,8 @@ def benchmark():
         texts=texts,
         language_id="en",
         max_new_tokens=1000,
-        cfg_weight=0
+        cfg_weight=0,
+        # micro_batch_size=8 # Optional: if we expose it later
     )
     
     if device == "cuda":
