@@ -409,8 +409,11 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         # Calculate expected mel lengths
         mel_len1 = prompt_feat_len # [B]
         
-        # UpsampleConformerEncoder returns upsampled lengths (total mel len)
-        total_mel_lens = h_lengths # [B]
+        # UpsampleConformerEncoder returns (xs, masks)
+        # masks is (B, 1, T), True where valid (due to ~make_pad_mask)
+        # We need lengths from this mask.
+        h_mask = h_lengths
+        total_mel_lens = h_mask.squeeze(1).sum(dim=1).long() # [B]
         
         # Handle lookahead trimming if not finalizing
         if finalize is False:
