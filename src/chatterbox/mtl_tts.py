@@ -164,16 +164,17 @@ class ChatterboxMultilingualTTS:
 
         
         # Safely initialize watermarker
-        if hasattr(perth, 'PerthImplicitWatermarker') and callable(perth.PerthImplicitWatermarker):
-            self.watermarker = perth.PerthImplicitWatermarker()
-        else:
-            import logging
-            logging.warning("PerthImplicitWatermarker not available or failed to load. Watermarking will be disabled.")
-            # Simple dummy class to prevent errors later
-            class DummyWatermarker:
-                def apply_watermark(self, wav, sample_rate):
-                    return wav
-            self.watermarker = DummyWatermarker()
+        # Safely initialize watermarker
+        # if hasattr(perth, 'PerthImplicitWatermarker') and callable(perth.PerthImplicitWatermarker):
+        #     self.watermarker = perth.PerthImplicitWatermarker()
+        # else:
+        import logging
+        logging.warning("Watermarking disabled by user request.")
+        # Simple dummy class to prevent errors later
+        class DummyWatermarker:
+            def apply_watermark(self, wav, sample_rate):
+                return wav
+        self.watermarker = DummyWatermarker()
 
     @classmethod
     def get_supported_languages(cls):
@@ -567,12 +568,16 @@ class ChatterboxMultilingualTTS:
         # CFG: duplicate tokens and T3Cond only when CFG is enabled
         if cfg_weight > 0:
             text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
-            cfg_t3_cond = T3Cond(
-                speaker_emb=torch.cat([t3_cond_to_use.speaker_emb, t3_cond_to_use.speaker_emb], dim=0),
-                cond_prompt_speech_tokens=torch.cat([t3_cond_to_use.cond_prompt_speech_tokens, t3_cond_to_use.cond_prompt_speech_tokens], dim=0) if t3_cond_to_use.cond_prompt_speech_tokens is not None else None,
-                emotion_adv=torch.cat([t3_cond_to_use.emotion_adv, t3_cond_to_use.emotion_adv], dim=0),
-            ).to(device=self.device)
-            t3_cond_to_use = cfg_t3_cond
+            
+            # Only duplicate conds if we are NOT relying on broadcasting
+            # If cond size is 1 and batch > 1, we leave it as 1 to broadcast to (2*batch) inside T3
+            if not (t3_cond_to_use.speaker_emb.shape[0] == 1 and batch_size > 1):
+                cfg_t3_cond = T3Cond(
+                    speaker_emb=torch.cat([t3_cond_to_use.speaker_emb, t3_cond_to_use.speaker_emb], dim=0),
+                    cond_prompt_speech_tokens=torch.cat([t3_cond_to_use.cond_prompt_speech_tokens, t3_cond_to_use.cond_prompt_speech_tokens], dim=0) if t3_cond_to_use.cond_prompt_speech_tokens is not None else None,
+                    emotion_adv=torch.cat([t3_cond_to_use.emotion_adv, t3_cond_to_use.emotion_adv], dim=0),
+                ).to(device=self.device)
+                t3_cond_to_use = cfg_t3_cond
 
         with torch.inference_mode():
             # T3 batch inference

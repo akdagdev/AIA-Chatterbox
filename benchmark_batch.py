@@ -82,8 +82,11 @@ def benchmark():
     
     # Inject timing into the model
     original_inference_batch = model.t3.inference_batch
-    original_s3gen_inference = model.s3gen.inference
+    # original_s3gen_inference = model.s3gen.inference # OLD
     
+    # Store original inference methods for all copies
+    original_s3gen_inferences = [s3gen.inference for s3gen in model.s3gen_copies]
+
     t3_times = []
     s3gen_times = []
     
@@ -97,18 +100,28 @@ def benchmark():
         t3_times.append(time.time() - start)
         return result
     
-    def timed_s3gen_inference(*args, **kwargs):
-        start = time.time()
-        if device == "cuda":
-            torch.cuda.synchronize()
-        result = original_s3gen_inference(*args, **kwargs)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        s3gen_times.append(time.time() - start)
-        return result
+    # Create a closure for each s3gen copy to track timing
+    def make_timed_s3gen_inference(original_method):
+        def timed_s3gen_inference(*args, **kwargs):
+            start = time.time()
+            if device == "cuda":
+                # Note: excessive sync inside threads might impact perf slightly, 
+                # but we need it for accurate component timing.
+                # In threaded execution, this global sync might be noisy.
+                # For now, we trust the relative buckets.
+                torch.cuda.synchronize()
+            result = original_method(*args, **kwargs)
+            if device == "cuda":
+                torch.cuda.synchronize()
+            s3gen_times.append(time.time() - start)
+            return result
+        return timed_s3gen_inference
     
     model.t3.inference_batch = timed_t3_inference_batch
-    model.s3gen.inference = timed_s3gen_inference
+    
+    # Monkey patch all copies
+    for i, s3gen in enumerate(model.s3gen_copies):
+        s3gen.inference = make_timed_s3gen_inference(original_s3gen_inferences[i])
     
     # Run 1 (for any remaining cache warming)
     model.generate_batch(
@@ -142,7 +155,8 @@ def benchmark():
     
     # Restore original methods
     model.t3.inference_batch = original_inference_batch
-    model.s3gen.inference = original_s3gen_inference
+    for i, s3gen in enumerate(model.s3gen_copies):
+        s3gen.inference = original_s3gen_inferences[i]
     
     # Calculate metrics
     total_audio_duration = 0
