@@ -344,6 +344,7 @@ class T3BatchStepCUDAGraphWrapper:
                 max_position,
             )
             # Copy static generated_ids back to original after first capture
+            static_tensors = self._bucket_static_tensors[bucket_key]
             generated_ids.copy_(static_tensors["generated_ids"])
         else:
             static_tensors = self._bucket_static_tensors[bucket_key]
