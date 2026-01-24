@@ -662,10 +662,10 @@ class ChatterboxMultilingualTTS:
                 # Careful: The raw wav tensor might be slightly larger due to padding structure.
                 # But cutting at valid_wav_len is safe.
                 
-                # wav_batch[i] is [1, T_max]
-                curr_wav = wav_batch[i, :, :valid_wav_len]
+                # wav_batch[i] is [T_max] (1D) because wav_batch is [B, T_max]
+                curr_wav = wav_batch[i, :valid_wav_len]
                 
-                wav_numpy = curr_wav.squeeze(0).detach().cpu().numpy()
+                wav_numpy = curr_wav.detach().cpu().numpy()
                 watermarked_wav = self.watermarker.apply_watermark(wav_numpy, sample_rate=self.sr)
                 results.append(torch.from_numpy(watermarked_wav).unsqueeze(0))
             
