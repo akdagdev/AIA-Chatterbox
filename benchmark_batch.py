@@ -27,27 +27,31 @@ def benchmark():
     
     model = ChatterboxMultilingualTTS.from_pretrained(device)
     
-    # Test texts of varying lengths
-    texts = [
-        "Hello, this is a quick test.",
-        "Batch processing allows us to synthesize multiple sentences at once, improving GPU utilization significantly.",
-        "The quick brown fox jumps over the lazy dog.",
-        "Artificial intelligence is transforming the way we interact with technology.",
-        "Short sentence.",
-        "Another one.",
-        "A slightly longer sentence to add some variety to the batch content.",
-        "Testing the limits of the batch size with eight sentences in total."
-    ]
+    # Import SpeechRequest
+    from chatterbox.mtl_tts import SpeechRequest
     
-    batch_size = len(texts)
+    # Test texts with mixed languages and prompts
+    # Note: ensure benchmark_output/output_0.wav etc exist or use None
+    requests = [
+        SpeechRequest(text="Hello, how are you?", language_id="en", audio_prompt_path=None),
+        SpeechRequest(text="Merhaba, nasılsın?", language_id="tr", audio_prompt_path=None),
+        SpeechRequest(text="Hola, ¿cómo estás?", language_id="es", audio_prompt_path=None),
+        SpeechRequest(text="Bonjour, comment allez-vous?", language_id="fr", audio_prompt_path=None),
+    ]
+
+    requests = requests * 4
+    
+    batch_size = len(requests)
     print(f"\nBenchmarking with batch size: {batch_size}")
     
-    # Warmup
-    print("Warming up...")
-    model.generate_batch(texts[:2], language_id="en", max_new_tokens=50, cfg_weight=0)
+    # Warmup: Run with FULL batch size to ensure CUDA graphs are captured correctly
+    print("Warming up with full batch size...")
+    # Generate batch accepts List[SpeechRequest] as 'texts' argument
+    model.generate_batch(texts=requests, language_id=None, max_new_tokens=400, cfg_weight=0.3)
+    print("Warmup complete - CUDA graphs captured")
     
     # Run Benchmark with detailed timing
-    print("\nStarting generation with profiling...")
+    print("\nStarting generation with profiling (Run 1 - cache warming)...")
     if device == "cuda":
         torch.cuda.synchronize()
     
@@ -81,13 +85,28 @@ def benchmark():
     model.t3.inference_batch = timed_t3_inference_batch
     model.s3gen.inference = timed_s3gen_inference
     
+    # Run 1 (for any remaining cache warming)
+    model.generate_batch(
+        texts=requests,
+        language_id=None,
+        max_new_tokens=400,
+        cfg_weight=0.3
+    )
+    
+    # Reset timing for Run 2
+    t3_times.clear()
+    s3gen_times.clear()
+    if device == "cuda":
+        torch.cuda.synchronize()
+    
+    print("Starting generation with profiling (Run 2 - actual measurement)...")
     start_time = time.time()
     
     audio_list = model.generate_batch(
-        texts=texts,
-        language_id="en",
-        max_new_tokens=1000,
-        cfg_weight=0
+        texts=requests,
+        language_id=None,
+        max_new_tokens=400,
+        cfg_weight=0.3
     )
     
     if device == "cuda":
@@ -113,7 +132,7 @@ def benchmark():
     
     rtf = generation_time / total_audio_duration
     latency = generation_time * 1000
-    throughput = len(texts) / generation_time
+    throughput = len(requests) / generation_time
     
     # Timing breakdown
     t3_total = sum(t3_times)

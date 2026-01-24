@@ -1,5 +1,6 @@
 import logging
 import json
+from typing import Union
 
 import torch
 from pathlib import Path
@@ -367,7 +368,7 @@ class MTLTokenizer:
     def text_to_tokens_batch(
         self,
         texts: list,
-        language_id: str = None,
+        language_id: Union[str, list] = None,
         lowercase: bool = True,
         nfkd_normalize: bool = True,
         pad_token_id: int = None,
@@ -401,10 +402,18 @@ class MTLTokenizer:
             pad_token_id = vocab.get("[PAD]", 0)
         
         # Encode all texts
-        token_lists = [
-            self.encode(text, language_id=language_id, lowercase=lowercase, nfkd_normalize=nfkd_normalize)
-            for text in texts
-        ]
+        if isinstance(language_id, list):
+            if len(language_id) != len(texts):
+                 raise ValueError("Length of language_id list must match length of texts list")
+            token_lists = [
+                self.encode(text, language_id=lid, lowercase=lowercase, nfkd_normalize=nfkd_normalize)
+                for text, lid in zip(texts, language_id)
+            ]
+        else:
+            token_lists = [
+                self.encode(text, language_id=language_id, lowercase=lowercase, nfkd_normalize=nfkd_normalize)
+                for text in texts
+            ]
         
         # Add SOT/EOT tokens to each list BEFORE padding
         if sot_token is not None or eot_token is not None:

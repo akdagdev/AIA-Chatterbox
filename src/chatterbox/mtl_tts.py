@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import List, Union, Optional, Dict
 from pathlib import Path
 import os
 
@@ -129,6 +130,12 @@ class Conditionals:
         kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
+@dataclass
+class SpeechRequest:
+    text: str
+    audio_prompt_path: Optional[str] = None
+    language_id: Optional[str] = None
+
 
 class ChatterboxMultilingualTTS:
     ENC_COND_LEN = 6 * S3_SR
@@ -229,7 +236,13 @@ class ChatterboxMultilingualTTS:
         )
         return cls.from_local(ckpt_dir, device)
     
-    def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
+    def _get_conditioning_for_prompt(self, wav_fpath, exaggeration=0.5):
+        """
+        Extract conditioning data (T3Cond and S3Gen ref_dict) from an audio file.
+        Returns:
+            t3_cond (T3Cond): Conditioning object for T3
+            s3gen_ref_dict (dict): Reference dict for S3Gen
+        """
         ## Load reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
@@ -252,8 +265,13 @@ class ChatterboxMultilingualTTS:
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
-            emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=ve_embed.dtype),
+            emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=ve_embed.dtype, device=self.device),
         ).to(device=self.device)
+        
+        return t3_cond, s3gen_ref_dict
+
+    def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
+        t3_cond, s3gen_ref_dict = self._get_conditioning_for_prompt(wav_fpath, exaggeration)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
     def generate(
@@ -337,7 +355,7 @@ class ChatterboxMultilingualTTS:
         self,
         texts: list,
         language_id: str,
-        audio_prompt_path=None,
+        audio_prompt_path: Union[str, List[str]] = None,
         exaggeration=0.5,
         cfg_weight=0.5,
         temperature=0.8,
@@ -351,47 +369,171 @@ class ChatterboxMultilingualTTS:
         Batch TTS generation for multiple texts simultaneously.
         
         Args:
-            texts: List of text strings to synthesize
-            language_id: Language code (e.g., 'en', 'de', 'fr')
-            audio_prompt_path: Optional path to reference audio for voice cloning
+            texts: List of text strings OR List of SpeechRequest objects
+            language_id: Language code (e.g., 'en', 'de', 'fr') - used if not in SpeechRequest
+            audio_prompt_path: Optional path for voice cloning - used if not in SpeechRequest
             
         Returns:
             List of torch.Tensor, each containing generated audio waveform
         """
-        if not texts:
-            raise ValueError("texts list cannot be empty")
-        
         batch_size = len(texts)
+        if batch_size == 0:
+            return []
+
+        # Convert simple list of strings to SpeechRequest list for unified processing
+        input_requests = []
+        if isinstance(texts[0], str):
+            if isinstance(audio_prompt_path, list):
+                if len(audio_prompt_path) != batch_size:
+                    raise ValueError(f"Number of audio prompts ({len(audio_prompt_path)}) must match batch size ({batch_size})")
+                for i in range(batch_size):
+                    input_requests.append(SpeechRequest(
+                        text=texts[i],
+                        audio_prompt_path=audio_prompt_path[i],
+                        language_id=language_id
+                    ))
+            else:
+                for t in texts:
+                    input_requests.append(SpeechRequest(
+                        text=t,
+                        audio_prompt_path=audio_prompt_path,  # Could be str or None
+                        language_id=language_id
+                    ))
+        else:
+            # Assume it is already a list of SpeechRequests
+            input_requests = texts
+        
+        # Prepare text list for tokenization
+        processed_texts = [r.text for r in input_requests]
+        
+        # Determine language for each item (fallback to global arg if missing in request)
+        # Note: current tokenizer `text_to_tokens_batch` accepts a single language_id for the whole batch
+        # If mixed languages are needed, tokenizer needs update. For now, we enforce single language or assume primary language.
+        # Checking if all requests have same language or if we use global
+        req_lang = input_requests[0].language_id or language_id
         
         # Validate language_id
-        if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+        if req_lang and req_lang.lower() not in SUPPORTED_LANGUAGES:
             supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
             raise ValueError(
-                f"Unsupported language_id '{language_id}'. "
+                f"Unsupported language_id '{req_lang}'. "
                 f"Supported languages: {supported_langs}"
             )
-        
-        if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
-        else:
-            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
-        # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
-            _cond: T3Cond = self.conds.t3
-            self.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
+        # Prepare conditioning
+        batched_t3_cond = None
+        item_ref_dicts = []
+
+        # Check if we have mixed prompts or single prompt
+        # We need to build conditioning for EACH item to be safe, or optimize if all same.
+        # Optimization: check if all prompt paths are None or same string?
+        # For simplicity and correctness with the new Struct design, let's process each one.
+        
+        # But wait, if they are all None (default), we shouldn't re-compute if self.conds exists.
+        # Let's check if ANY request has a specific prompt path.
+        has_custom_prompts = any(r.audio_prompt_path is not None for r in input_requests)
+        
+        if has_custom_prompts:
+            # Multi-speaker batching (or explicitly specified single speaker)
+            t3_cond_list = []
+            for req in input_requests:
+                prompt_path = req.audio_prompt_path
+                current_exaggeration = exaggeration # Support per-request exaggeration? For now global.
+                
+                if prompt_path:
+                    t3_c, s3_d = self._get_conditioning_for_prompt(prompt_path, current_exaggeration)
+                else:
+                    # Fallback to existing prompts if set? Or error?
+                    # If mixed (some have prompt, some don't), we probably want to use 'default' voice for None.
+                    # Assuming self.conds is available used for defaults.
+                    if hasattr(self, 'conds') and self.conds:
+                        t3_c = self.conds.t3
+                        s3_d = self.conds.gen
+                    else:
+                        raise ValueError("Some requests missing audio_prompt_path and no default voice loaded.")
+
+                t3_cond_list.append(t3_c)
+                item_ref_dicts.append(s3_d)
+            
+            # Merge T3Conds logic...
+            # Stack speaker embeddings
+            speaker_emb = torch.cat([c.speaker_emb for c in t3_cond_list], dim=0)
+            emotion_adv = torch.cat([c.emotion_adv for c in t3_cond_list], dim=0)
+            
+            # Stack prompt tokens
+            prompt_tokens_list = [c.cond_prompt_speech_tokens for c in t3_cond_list if c.cond_prompt_speech_tokens is not None]
+            
+            cond_prompt_speech_tokens = None
+            if prompt_tokens_list:
+                 if len(prompt_tokens_list) == len(t3_cond_list):
+                     max_len = max([t.shape[1] for t in prompt_tokens_list])
+                     padded_prompts = []
+                     for t in prompt_tokens_list:
+                         if t.shape[1] < max_len:
+                             pad_amount = max_len - t.shape[1]
+                             t = F.pad(t, (0, pad_amount), value=0)
+                         padded_prompts.append(t)
+                     cond_prompt_speech_tokens = torch.cat(padded_prompts, dim=0)
+            
+            batched_t3_cond = T3Cond(
+                speaker_emb=speaker_emb,
+                cond_prompt_speech_tokens=cond_prompt_speech_tokens,
+                emotion_adv=emotion_adv
             ).to(device=self.device)
 
-        # Batch tokenization with padding - SOT/EOT added before padding for correct position
-        normalized_texts = [punc_norm(t) for t in texts]
+        else:
+            # No custom prompts in requests, use global defaults
+            # ... (existing single speaker logic) ...
+            
+            # Use global audio_prompt_path if provided (but we successfully parsed it into requests above)
+            # If all requests have None prompt, but global arg was passed, input_requests has it.
+            # So `has_custom_prompts` would be true if global arg was passed.
+            # Thus we land here only if NO prompts provided anywhere.
+            
+            # Verify self.conds is set
+            if not hasattr(self, 'conds') or self.conds is None:
+                 pass # Warning/Error handled elsewhere or relying on pre-load
+
+            batched_t3_cond = self.conds.t3
+            
+            # Update exaggeration if needed (global only)
+            if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+                _cond: T3Cond = self.conds.t3
+                # Optimization: Check if we need to clone.
+                # If we modify self.conds in place it affects future calls.
+                # Code below creates new T3Cond, updates self.conds.t3
+                self.conds.t3 = T3Cond(
+                    speaker_emb=_cond.speaker_emb,
+                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                    emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
+                ).to(device=self.device)
+                batched_t3_cond = self.conds.t3 # Update reference
+
+            item_ref_dicts = [self.conds.gen] * batch_size
+
+        # Use the decided T3Cond
+        t3_cond_to_use = batched_t3_cond if batched_t3_cond else self.conds.t3
+
+        # Prepare language_id list
+        # If input_requests (SpeechRequest objects) have language_id, use it.
+        # Fallback to global language_id.
+        language_ids = []
+        for r in input_requests:
+            lid = r.language_id or language_id
+            if not lid:
+                 raise ValueError(f"Language ID not specified for request '{r.text[:20]}...' and no global language_id provided")
+            if lid.lower() not in SUPPORTED_LANGUAGES:
+                 raise ValueError(f"Unsupported language_id '{lid}'")
+            language_ids.append(lid.lower())
+
+        # Batch tokenization
+        normalized_texts = [punc_norm(t) for t in processed_texts]
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token
+        
         text_tokens, attention_mask = self.tokenizer.text_to_tokens_batch(
             normalized_texts, 
-            language_id=language_id.lower() if language_id else None,
+            language_id=language_ids,
             sot_token=sot,
             eot_token=eot
         )
@@ -412,7 +554,7 @@ class ChatterboxMultilingualTTS:
         with torch.inference_mode():
             # T3 batch inference
             speech_tokens = self.t3.inference_batch(
-                t3_cond=self.conds.t3,
+                t3_cond=t3_cond_to_use,
                 text_tokens=text_tokens,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -449,7 +591,7 @@ class ChatterboxMultilingualTTS:
                     with torch.cuda.stream(stream):
                         wav, _ = s3gen_copy.inference(
                             speech_tokens=item_tokens_list[i],
-                            ref_dict=self.conds.gen,
+                            ref_dict=item_ref_dicts[i], # Use per-item ref_dict
                         )
                         wav_futures[i] = wav.squeeze(0)
                 
@@ -461,7 +603,7 @@ class ChatterboxMultilingualTTS:
                     s3gen_copy = self.s3gen_copies[0]
                     wav, _ = s3gen_copy.inference(
                         speech_tokens=item_tokens_list[i],
-                        ref_dict=self.conds.gen,
+                        ref_dict=item_ref_dicts[i], # Use per-item ref_dict
                     )
                     wav_futures[i] = wav.squeeze(0)
             
