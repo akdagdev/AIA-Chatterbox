@@ -406,35 +406,64 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
 
         h = self.encoder_proj(h)
         
-        # Calculate mel lengths
+        # Calculate expected mel lengths
         mel_len1 = prompt_feat_len # [B]
         mel_len2 = (token_len2.float() / self.input_frame_rate * 22050 / 256).long() # [B]
-        total_mel_lens = mel_len1 + mel_len2
-        max_mel_len = total_mel_lens.max().item()
+        
+        # Run Length Regulator (batched loop)
+        h_expanded_list = []
+        max_h_len = 0
+        actual_mel_lens = []
+        
+        for i in range(batch_size):
+            p_len = token_len1[i]
+            t_len = token_len2[i]
+            
+            # Slice valid text encoding
+            # h is [B, Total_Tok_Len, D]. 
+            # Prompt part is [0 : p_len]
+            # Text part is [p_len : p_len + t_len] (because we concated prompt+text tokens)
+            curr_h_prompt = h[i, :p_len].unsqueeze(0)
+            curr_h_text = h[i, p_len : p_len+t_len].unsqueeze(0)
+            
+            curr_mel_len1 = mel_len1[i].item()
+            curr_mel_len2 = mel_len2[i].item()
+            
+            curr_h_exp, _ = self.length_regulator.inference(
+                curr_h_prompt, 
+                curr_h_text, 
+                curr_mel_len1, 
+                curr_mel_len2, 
+                self.input_frame_rate
+            )
+            h_expanded_list.append(curr_h_exp.squeeze(0))
+            max_h_len = max(max_h_len, curr_h_exp.size(1))
+            actual_mel_lens.append(curr_h_exp.size(1))
+
+        # Stack back to batch [B, Max_Mel_Len, D]
+        h_mel = torch.zeros((batch_size, max_h_len, self.output_size), dtype=h.dtype, device=h.device)
+        for i, hh in enumerate(h_expanded_list):
+            h_mel[i, :hh.size(0)] = hh
+            
+        # Update lens just in case LR changed something slightly
+        total_mel_lens = torch.tensor(actual_mel_lens, dtype=torch.long, device=token.device)
+        max_mel_len = max_h_len
 
         # get conditions - batch-aware
         # prompt_feat is [B, Max_P_Len, D]
-        # We need to construct conds [B, Max_Mel_Len, D]
-        # placing prompt_feat at start
         conds = torch.zeros([batch_size, max_mel_len, self.output_size], device=token.device).to(h.dtype)
         for i in range(batch_size):
             p_len = mel_len1[i]
+            # Copy valid prompt feat
             conds[i, :p_len] = prompt_feat[i, :p_len]
+            
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(total_mel_lens)).to(h)
         
         # Call decoder
-        # CausalConditionalCFM.forward does not accept prompt_len or flow_cache
-        # It relies on 'cond' to provide prompt information (in-painting happens via cond?)
-        # Actually, looking at CausalConditionalCFM implementation:
-        # It generates z from rand_noise. 
-        # It does NOT preserve prompt explicitly like ConditionalCFM does with flow_cache.
-        # It assumes the task is to generate the target mel given the condition.
-        # Since 'cond' contains the prompt frames aligned at the start, the model
-        # should learn to copy them or extend them.
         feat, _ = self.decoder(
-            mu=h.transpose(1, 2).contiguous(),
+            mu=h_mel.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,

@@ -85,35 +85,90 @@ class ConditionalCFM(BASECFM):
             cond: Not used but kept for future purposes
         """
         t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
-        t = t.unsqueeze(dim=0)
+        # t is scalar.
+
+        # Batch size
+        b = x.size(0)
 
         # I am storing this because I can later plot it by putting a debugger here and saving it to a file
         # Or in future might add like a return_all_steps flag
         sol = []
 
-        # Do not use concat, it may cause memory format changed and trt infer with wrong results!
-        x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
-        mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=x.dtype)
-        mu_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
-        t_in = torch.zeros([2], device=x.device, dtype=x.dtype)
-        spks_in = torch.zeros([2, 80], device=x.device, dtype=x.dtype)
-        cond_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
+        # Prepare CFG batch (2 * B)
+        # Structure: [Conditional, Unconditional]
+        # x: Repeated
+        # mask: Repeated
+        # mu: [mu, zeros]
+        # t: Repeated
+        # spks: [spks, zeros?] -> Usually we drop spk cond for CFG too? 
+        #   Original code: spks_in[0] = spks. spks_in initialized to zeros. So yes, uncond has zero spks.
+        # cond: [cond, zeros]
+
+        # Allocate buffers
+        # We can construct them directly rather than init zeros and assign.
+        
+        # x_in: repeat x twice
+        x_in = torch.cat([x, x], dim=0)
+        
+        # mask_in: repeat mask twice
+        mask_in = torch.cat([mask, mask], dim=0)
+        
+        # mu_in: [mu, zeros]
+        mu_uncond = torch.zeros_like(mu)
+        mu_in = torch.cat([mu, mu_uncond], dim=0)
+        
+        # t_in: [t, t] (expanded to batch)
+        # t is scalar. We need [2*B]
+        t_batch = t.expand(b)
+        t_in = torch.cat([t_batch, t_batch], dim=0)
+        
+        # spks_in
+        spks_uncond = torch.zeros_like(spks)
+        spks_in = torch.cat([spks, spks_uncond], dim=0)
+        
+        # cond_in
+        cond_uncond = torch.zeros_like(cond)
+        cond_in = torch.cat([cond, cond_uncond], dim=0)
+
         for step in range(1, len(t_span)):
             # Classifier-Free Guidance inference introduced in VoiceBox
-            x_in[:] = x
-            mask_in[:] = mask
-            mu_in[0] = mu
-            t_in[:] = t.unsqueeze(0)
-            spks_in[0] = spks
-            cond_in[0] = cond
+            # Update inputs changing over time
+            
+            # Update x (current state)
+            x_in = torch.cat([x, x], dim=0)
+            
+            # Update t
+            t_curr = t.expand(b)
+            t_in = torch.cat([t_curr, t_curr], dim=0)
+            
+            # mask, mu, spks, cond stay constant usually, but let's keep consistent with original loop if they modify in place?
+            # Original code modified buffers in place. 
+            # We can just reuse our constructed buffers if they don't change.
+            # Only x and t change. 
+            
             dphi_dt = self.forward_estimator(
                 x_in, mask_in,
                 mu_in, t_in,
                 spks_in,
                 cond_in
             )
-            dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-            dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt)
+            
+            # Split
+            dphi_dt_cond, dphi_dt_uncond = torch.chunk(dphi_dt, 2, dim=0)
+            
+            # CFG Formula
+            # rate * cond + (1 - rate) * uncond? 
+            # Original: (1.0 + rate) * dphi - rate * cfg_dphi
+            # dphi is conditional (index 0). cfg_dphi is unconditional (index 1).
+            # Wait, original code:
+            # dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
+            # x.size(0) was 1 (in original context). 
+            # So index 0 (cond), index 1 (uncond).
+            # Formula: (1 + cfg) * cond - cfg * uncond
+            # = cond + cfg * (cond - uncond). Yes, standard CFG.
+            
+            dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt_cond - self.inference_cfg_rate * dphi_dt_uncond)
+            
             x = x + dt * dphi_dt
             t = t + dt
             sol.append(x)
