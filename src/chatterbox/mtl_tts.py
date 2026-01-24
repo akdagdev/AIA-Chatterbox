@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 import os
+from typing import Iterator, List, Optional, Generator, Union, Any
+from collections import deque
 
 import librosa
 import torch
@@ -496,3 +498,160 @@ class ChatterboxMultilingualTTS:
             
             # print(f"DEBUG: generate_batch returning {len(results)} items")
             return results
+
+    def generate_stream(
+        self,
+        text_iterator: Iterator[str],
+        language_id: str,
+        micro_batch_size: int = 4,
+        prefetch_batches: int = 1,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        max_new_tokens=1000,
+        max_cache_len=1500,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+    ) -> Generator[torch.Tensor, None, None]:
+        """
+        Streaming TTS generation. Consumes text from an iterator and yields audio tensors.
+        Designed for low latency/high throughput on servers.
+        
+        Args:
+            text_iterator: Iterator/Generator yielding text strings.
+            micro_batch_size: Number of sentences to process in one GPU batch.
+            prefetch_batches: Number of batches to keep "in-flight" on GPU before yielding.
+                              Increase for higher throughput, decrease for lower latency.
+        
+        Yields:
+            torch.Tensor: Generated audio waveforms (1, samples)
+        """
+        # Validate and Setup
+        if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+             raise ValueError(f"Unsupported language_id '{language_id}'")
+        
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first"
+
+        # Update exaggeration logic
+        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+             self.conds.t3 = T3Cond(
+                 speaker_emb=self.conds.t3.speaker_emb,
+                 cond_prompt_speech_tokens=self.conds.t3.cond_prompt_speech_tokens,
+                 emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=self.conds.t3.speaker_emb.dtype),
+             ).to(device=self.device)
+
+        # Token definitions
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        
+        # Streams and State
+        num_copies = len(self.s3gen_copies)
+        s3gen_streams = [torch.cuda.Stream() for _ in range(num_copies)]
+        
+        # State
+        text_buffer = []
+        # Queue holding (stream, wav_tensor_on_gpu) tuples
+        result_queue = deque()
+        # Round-robin counter for S3Gen copies
+        global_sample_idx = 0
+
+        def process_batch(batch_texts):
+             nonlocal global_sample_idx
+             # Tokenize on CPU
+             norm_texts = [punc_norm(t) for t in batch_texts]
+             tokens, mask = self.tokenizer.text_to_tokens_batch(
+                 norm_texts,
+                 language_id=language_id.lower() if language_id else None,
+                 sot_token=sot,
+                 eot_token=eot
+             )
+             tokens = tokens.to(self.device)
+             tokens = torch.where(mask.to(self.device) == 0,
+                                  torch.tensor(eot, device=self.device), tokens)
+             tokens = torch.cat([tokens, tokens], dim=0)
+
+             # T3 Inference (Synchronous on Default Stream)
+             with torch.inference_mode():
+                 speech_tokens = self.t3.inference_batch(
+                     t3_cond=self.conds.t3,
+                     text_tokens=tokens,
+                     max_new_tokens=max_new_tokens,
+                     temperature=temperature,
+                     cfg_weight=cfg_weight,
+                     max_cache_len=max_cache_len,
+                     repetition_penalty=repetition_penalty,
+                     min_p=min_p,
+                     top_p=top_p,
+                 )
+
+             # S3Gen Inference (Async on Streams)
+             batch_futures = []
+             batch_len = len(batch_texts)
+             
+             for i in range(batch_len):
+                 copy_idx = global_sample_idx % num_copies
+                 stream = s3gen_streams[copy_idx]
+                 s3gen_copy = self.s3gen_copies[copy_idx]
+                 
+                 item_tokens = drop_invalid_tokens(speech_tokens[i])
+                 item_tokens = item_tokens.to(self.device)
+                 
+                 with torch.cuda.stream(stream):
+                     wav, _ = s3gen_copy.inference(
+                         speech_tokens=item_tokens,
+                         ref_dict=self.conds.gen,
+                     )
+                     # wav is on GPU. Store it along with stream to sync later?
+                     # Actually we just need to store the wav tensor. 
+                     # Accessing it on CPU later will implicitly sync or block.
+                     batch_futures.append(wav.squeeze(0))
+                 
+                 global_sample_idx += 1
+            
+             return batch_futures
+
+        # Main Loop
+        with torch.inference_mode():
+            for text in text_iterator:
+                text_buffer.append(text)
+                
+                if len(text_buffer) >= micro_batch_size:
+                    # Submit batch
+                    futures = process_batch(text_buffer)
+                    result_queue.extend(futures)
+                    text_buffer = []
+
+                    # If prefetch buffer full, yield oldest
+                    # We check if we have more than (prefetch * MB_SIZE) items?
+                    # prefetch_batches means "batch groups".
+                    # Let's count items.
+                    min_items_in_flight = prefetch_batches * micro_batch_size
+                    
+                    while len(result_queue) > min_items_in_flight:
+                        # Yield ONE item
+                        future_wav = result_queue.popleft()
+                        # Move to CPU (Blocking point)
+                        wav_np = future_wav.detach().cpu().numpy()
+                        # Watermark
+                        watermarked = self.watermarker.apply_watermark(wav_np, sample_rate=self.sr)
+                        yield torch.from_numpy(watermarked).unsqueeze(0)
+
+            # Process remaining buffer
+            if text_buffer:
+                futures = process_batch(text_buffer)
+                result_queue.extend(futures)
+            
+            # Drain queue
+            while result_queue:
+                future_wav = result_queue.popleft()
+                wav_np = future_wav.detach().cpu().numpy()
+                watermarked = self.watermarker.apply_watermark(wav_np, sample_rate=self.sr)
+                yield torch.from_numpy(watermarked).unsqueeze(0)
+            
+            # Final sync (good practice)
+            torch.cuda.synchronize()
