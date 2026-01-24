@@ -431,6 +431,8 @@ class ChatterboxMultilingualTTS:
         # Optimization: check if all prompt paths are None or same string?
         # For simplicity and correctness with the new Struct design, let's process each one.
         
+        has_custom_prompts = any(r.audio_prompt_path is not None for r in input_requests)
+        
         if has_custom_prompts or any(r.conditionals is not None for r in input_requests):
             # Multi-speaker batching (or explicitly specified single speaker)
             t3_cond_list = []
