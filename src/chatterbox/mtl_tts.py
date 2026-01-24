@@ -210,7 +210,7 @@ class ChatterboxMultilingualTTS:
         for i in range(NUM_S3GEN_COPIES):
             s3gen_copy = S3Gen()
             s3gen_copy.load_state_dict(s3gen_state)
-            s3gen_copy.to(device).eval()
+            s3gen_copy.to(device).half().eval()  # Use FP16 for faster inference
             s3gen_copies.append(s3gen_copy)
         
         # Primary s3gen is the first copy
