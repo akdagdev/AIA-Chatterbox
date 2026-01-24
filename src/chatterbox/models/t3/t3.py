@@ -665,6 +665,9 @@ class T3(nn.Module):
         finished_mask = torch.zeros(input_batch_size, dtype=torch.bool, device=device)
         indices = torch.arange(1, max_new_tokens + 1, device=device)
         batch_idx = torch.arange(input_batch_size, dtype=torch.long, device=device)
+        
+        # Pre-allocate stop_token_tensor for CUDA graph compatibility
+        pre_stop_token_tensor = torch.tensor([[self.hp.stop_speech_token]], device=device, dtype=torch.long)
 
         # Select generation backend
         is_cuda = device.type == "cuda"
@@ -683,6 +686,7 @@ class T3(nn.Module):
                     self.top_p_warper,
                     input_batch_size,
                     self.hp.stop_speech_token,
+                    pre_stop_token_tensor,
                 )
             self.batch_cudagraph_wrapper.guard()
             generate_token_batch = self.batch_cudagraph_wrapper
@@ -716,6 +720,7 @@ class T3(nn.Module):
                 input_batch_size,
                 finished_mask,
                 stop_token_id=self.hp.stop_speech_token,
+                stop_token_tensor=pre_stop_token_tensor,
                 max_position=max_position,
             )
             output_logits = output_logits.clone()
@@ -895,6 +900,7 @@ def generate_t3_token_batch(
     input_batch_size: int,
     finished_mask: Tensor = None,
     stop_token_id: int = None,
+    stop_token_tensor: Tensor = None,  # Pre-allocated for CUDA graph compatibility
     max_position: Optional[int] = None,
 ):
     """
@@ -903,6 +909,7 @@ def generate_t3_token_batch(
     Args:
         input_batch_size: Number of actual input texts (before CFG doubling)
         finished_mask: Boolean tensor tracking which batch items have generated EOS
+        stop_token_tensor: Pre-allocated tensor for stop token (required for CUDA graphs)
     """
     # logits shape: (effective_batch_size, 1, vocab_size) -> (effective_batch_size, vocab_size)
     logits = output_logits[:, -1, :]
@@ -929,8 +936,7 @@ def generate_t3_token_batch(
     next_token = torch.multinomial(probs, num_samples=1)  # shape: (input_batch_size, 1)
 
     # Force finished items to generate stop_token (prevents hallucination)
-    if finished_mask is not None and stop_token_id is not None:
-        stop_token_tensor = torch.tensor([[stop_token_id]], device=next_token.device, dtype=next_token.dtype)
+    if finished_mask is not None and stop_token_tensor is not None:
         next_token = torch.where(finished_mask.unsqueeze(1), stop_token_tensor, next_token)
 
     # Update generated_ids for each batch item

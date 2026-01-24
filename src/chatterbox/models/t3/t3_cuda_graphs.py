@@ -230,6 +230,7 @@ class T3BatchStepCUDAGraphWrapper:
         top_p_warper: Any,
         input_batch_size: int,
         stop_token_id: int,
+        stop_token_tensor: torch.Tensor,  # Pre-allocated tensor
     ):
         self.generate_token_batch = generate_token_batch
         self.patched_model = patched_model
@@ -239,6 +240,7 @@ class T3BatchStepCUDAGraphWrapper:
         self.top_p_warper = top_p_warper
         self.input_batch_size = input_batch_size
         self.stop_token_id = stop_token_id
+        self.stop_token_tensor = stop_token_tensor
 
         self._bucket_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._bucket_static_tensors: Dict[int, dict] = {}
@@ -297,6 +299,7 @@ class T3BatchStepCUDAGraphWrapper:
                     self.input_batch_size,
                     static_tensors["finished_mask"],
                     self.stop_token_id,
+                    self.stop_token_tensor,  # Use pre-allocated tensor
                     static_tensors["max_position"],
                 )
 
