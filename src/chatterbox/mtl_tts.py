@@ -205,15 +205,19 @@ class ChatterboxMultilingualTTS:
         s3gen_state = torch.load(ckpt_dir / "s3gen.pt", map_location=device, weights_only=True)
         
         # Create 4 S3Gen copies for parallel inference
+        # First copy stays FP32 for embed_ref compatibility, others use FP16 for speed
         NUM_S3GEN_COPIES = 4
         s3gen_copies = []
         for i in range(NUM_S3GEN_COPIES):
             s3gen_copy = S3Gen()
             s3gen_copy.load_state_dict(s3gen_state)
-            s3gen_copy.to(device).half().eval()  # Use FP16 for faster inference
+            s3gen_copy.to(device)
+            if i > 0:  # Only non-primary copies use FP16
+                s3gen_copy.half()
+            s3gen_copy.eval()
             s3gen_copies.append(s3gen_copy)
         
-        # Primary s3gen is the first copy
+        # Primary s3gen is the first copy (FP32 for embed_ref)
         s3gen = s3gen_copies[0]
 
         tokenizer = MTLTokenizer(
