@@ -667,11 +667,37 @@ class T3(nn.Module):
         batch_idx = torch.arange(input_batch_size, dtype=torch.long, device=device)
 
         # Select generation backend
-        backend = "reduce-overhead" if device.type == "cuda" else "eager"
-        generate_token_batch = _generate_token_batch_variants.get(backend, _generate_token_batch_variants["eager"])
+        is_cuda = device.type == "cuda"
+        
+        if is_cuda:
+            # Use CUDA Graphs for optimized generation
+            if not hasattr(self, "batch_cudagraph_wrapper") or \
+               self.batch_cudagraph_wrapper.input_batch_size != input_batch_size:
+                from .t3_cuda_graphs import T3BatchStepCUDAGraphWrapper
+                self.batch_cudagraph_wrapper = T3BatchStepCUDAGraphWrapper(
+                    generate_t3_token_batch,
+                    self.patched_model,
+                    kv_cache,
+                    self.repetition_penalty_processor,
+                    self.min_p_warper,
+                    self.top_p_warper,
+                    input_batch_size,
+                    self.hp.stop_speech_token,
+                )
+            self.batch_cudagraph_wrapper.guard()
+            generate_token_batch = self.batch_cudagraph_wrapper
+        else:
+            generate_token_batch = _generate_token_batch_variants["eager"]
 
         for i in tqdm(range(max_new_tokens), desc="Batch Sampling", dynamic_ncols=True):
             i_tensor = indices[i]
+            
+            # Use bucketing for CUDA graphs
+            if is_cuda:
+                bucket_size = 250
+                max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT)
+            else:
+                max_position = None
 
             next_token, output_logits = generate_token_batch(
                 self._speech_embedding_cache,
@@ -690,7 +716,7 @@ class T3(nn.Module):
                 input_batch_size,
                 finished_mask,
                 stop_token_id=self.hp.stop_speech_token,
-                max_position=None,
+                max_position=max_position,
             )
             output_logits = output_logits.clone()
 

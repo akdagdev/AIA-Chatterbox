@@ -212,3 +212,165 @@ class T3StepCUDAGraphWrapper:
 
     def mark_new_generation(self):
         self.kv_cache.reset()
+
+
+class T3BatchStepCUDAGraphWrapper:
+    """
+    CUDA Graph wrapper for batch token generation.
+    Similar to T3StepCUDAGraphWrapper but handles batch_size > 1 and finished_mask.
+    """
+
+    def __init__(
+        self,
+        generate_token_batch: Callable,
+        patched_model: Any,
+        kv_cache: Any,
+        repetition_penalty_processor: Any,
+        min_p_warper: Any,
+        top_p_warper: Any,
+        input_batch_size: int,
+        stop_token_id: int,
+    ):
+        self.generate_token_batch = generate_token_batch
+        self.patched_model = patched_model
+        self.kv_cache = kv_cache
+        self.repetition_penalty_processor = repetition_penalty_processor
+        self.min_p_warper = min_p_warper
+        self.top_p_warper = top_p_warper
+        self.input_batch_size = input_batch_size
+        self.stop_token_id = stop_token_id
+
+        self._bucket_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
+        self._bucket_static_tensors: Dict[int, dict] = {}
+        self._captured_buckets = set()
+        self.dtype = patched_model.dtype
+
+    def guard(self):
+        assert self.patched_model.dtype == self.dtype
+
+    def _capture_graph_for_bucket(
+        self,
+        bucket_key: int,
+        speech_embedding_cache: torch.Tensor,
+        output_logits: torch.Tensor,
+        i_tensor: torch.Tensor,
+        batch_idx: torch.Tensor,
+        speech_pos_embedding_cache: torch.Tensor,
+        generated_ids: torch.Tensor,
+        cfg_weight: float,
+        temperature: float,
+        finished_mask: torch.Tensor,
+        max_position: Optional[int] = None,
+    ) -> None:
+        print(f"Capturing CUDA graph for batch bucket {bucket_key}")
+
+        self._bucket_graphs[bucket_key] = torch.cuda.CUDAGraph()
+        static_tensors = {}
+
+        static_tensors["speech_embedding_cache"] = speech_embedding_cache.clone()
+        static_tensors["output_logits"] = output_logits.clone()
+        static_tensors["i_tensor"] = i_tensor.clone()
+        static_tensors["batch_idx"] = batch_idx.clone()
+        static_tensors["speech_pos_embedding_cache"] = speech_pos_embedding_cache.clone()
+        static_tensors["generated_ids"] = generated_ids.clone()
+        static_tensors["cfg_weight"] = cfg_weight
+        static_tensors["temperature"] = temperature
+        static_tensors["finished_mask"] = finished_mask.clone()
+        static_tensors["max_position"] = bucket_key
+
+        with torch.inference_mode():
+            with torch.cuda.graph(self._bucket_graphs[bucket_key]):
+                static_tensors["out_1"], static_tensors["out_2"] = self.generate_token_batch(
+                    static_tensors["speech_embedding_cache"],
+                    static_tensors["output_logits"],
+                    static_tensors["i_tensor"],
+                    static_tensors["batch_idx"],
+                    static_tensors["speech_pos_embedding_cache"],
+                    static_tensors["generated_ids"],
+                    static_tensors["cfg_weight"],
+                    static_tensors["temperature"],
+                    self.repetition_penalty_processor,
+                    self.min_p_warper,
+                    self.top_p_warper,
+                    self.patched_model,
+                    self.kv_cache,
+                    self.input_batch_size,
+                    static_tensors["finished_mask"],
+                    self.stop_token_id,
+                    static_tensors["max_position"],
+                )
+
+        self._bucket_static_tensors[bucket_key] = static_tensors
+        self._captured_buckets.add(bucket_key)
+
+    def __call__(
+        self,
+        speech_embedding_cache: torch.Tensor,
+        output_logits: torch.Tensor,
+        i_tensor: torch.Tensor,
+        batch_idx: torch.Tensor,
+        speech_pos_embedding_cache: torch.Tensor,
+        generated_ids: torch.Tensor,
+        cfg_weight: float,
+        temperature: float,
+        repetition_penalty_processor: Any = None,
+        min_p_warper: Any = None,
+        top_p_warper: Any = None,
+        patched_model: Any = None,
+        kv_cache: Any = None,
+        input_batch_size: int = 1,
+        finished_mask: torch.Tensor = None,
+        stop_token_id: int = None,
+        max_position: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        bucket_key = max_position or TOKEN_LIMIT
+
+        if bucket_key not in self._captured_buckets:
+            self._capture_graph_for_bucket(
+                bucket_key,
+                speech_embedding_cache,
+                output_logits,
+                i_tensor,
+                batch_idx,
+                speech_pos_embedding_cache,
+                generated_ids,
+                cfg_weight,
+                temperature,
+                finished_mask,
+                max_position,
+            )
+        else:
+            static_tensors = self._bucket_static_tensors[bucket_key]
+            static_tensors["speech_embedding_cache"].copy_(speech_embedding_cache)
+            static_tensors["output_logits"].copy_(output_logits)
+            static_tensors["i_tensor"].copy_(i_tensor)
+            static_tensors["batch_idx"].copy_(batch_idx)
+            static_tensors["speech_pos_embedding_cache"].copy_(speech_pos_embedding_cache)
+            static_tensors["generated_ids"].copy_(generated_ids)
+            static_tensors["finished_mask"].copy_(finished_mask)
+            static_tensors["cfg_weight"] = cfg_weight
+            static_tensors["temperature"] = temperature
+            static_tensors["max_position"] = max_position
+
+            self._bucket_graphs[bucket_key].replay()
+
+        static_tensors = self._bucket_static_tensors[bucket_key]
+        return (
+            static_tensors["out_1"],
+            static_tensors["out_2"],
+        )
+
+    def reset(self, bucket_key: Optional[int] = None) -> None:
+        if bucket_key is not None:
+            if bucket_key in self._bucket_graphs:
+                del self._bucket_graphs[bucket_key]
+            if bucket_key in self._bucket_static_tensors:
+                del self._bucket_static_tensors[bucket_key]
+            self._captured_buckets.discard(bucket_key)
+        else:
+            self._bucket_graphs.clear()
+            self._bucket_static_tensors.clear()
+            self._captured_buckets.clear()
+
+    def mark_new_generation(self):
+        self.kv_cache.reset()
