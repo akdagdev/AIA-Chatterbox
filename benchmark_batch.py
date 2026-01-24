@@ -33,10 +33,10 @@ def benchmark():
     # Test texts with mixed languages and prompts
     # Note: ensure benchmark_output/output_0.wav etc exist or use None
     requests = [
-        SpeechRequest(text="Hello, how are you?", language_id="en", audio_prompt_path=None),
-        SpeechRequest(text="Merhaba, nasılsın?", language_id="tr", audio_prompt_path=None),
-        SpeechRequest(text="Hola, ¿cómo estás?", language_id="es", audio_prompt_path=None),
-        SpeechRequest(text="Bonjour, comment allez-vous?", language_id="fr", audio_prompt_path=None),
+        SpeechRequest(text="Hello, how are you?", language_id="en", audio_prompt_path="referencebill.mp3"),
+        SpeechRequest(text="Merhaba, nasılsın?", language_id="tr", audio_prompt_path="referencekim.wav"),
+        SpeechRequest(text="Hola, ¿cómo estás?", language_id="es", audio_prompt_path="referencebill.mp3"),
+        SpeechRequest(text="Bonjour, comment allez-vous?", language_id="fr", audio_prompt_path="referencekim.wav"),
     ]
 
     requests = requests * 4

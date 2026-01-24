@@ -550,6 +550,15 @@ class ChatterboxMultilingualTTS:
 
         # CFG: duplicate tokens
         text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+        
+        # CFG: duplicate T3Cond components to match doubled text_tokens
+        if cfg_weight > 0:
+            cfg_t3_cond = T3Cond(
+                speaker_emb=torch.cat([t3_cond_to_use.speaker_emb, t3_cond_to_use.speaker_emb], dim=0),
+                cond_prompt_speech_tokens=torch.cat([t3_cond_to_use.cond_prompt_speech_tokens, t3_cond_to_use.cond_prompt_speech_tokens], dim=0) if t3_cond_to_use.cond_prompt_speech_tokens is not None else None,
+                emotion_adv=torch.cat([t3_cond_to_use.emotion_adv, t3_cond_to_use.emotion_adv], dim=0),
+            ).to(device=self.device)
+            t3_cond_to_use = cfg_t3_cond
 
         with torch.inference_mode():
             # T3 batch inference
