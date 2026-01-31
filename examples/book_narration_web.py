@@ -9,6 +9,7 @@ from typing import List, Generator
 
 import torch
 import torchaudio
+import soundfile as sf
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -174,7 +175,10 @@ async def generate(text: str = Form(...), ref_audio: UploadFile = File(...)):
 
         # Convert to bytes
         buffer = io.BytesIO()
-        torchaudio.save(buffer, final_audio, model.sr, format="wav")
+        # torchaudio.save fails with BytesIO on some versions/backends (torchcodec)
+        # Use soundfile instead
+        wav_numpy = final_audio.squeeze(0).cpu().numpy()
+        sf.write(buffer, wav_numpy, model.sr, format='WAV')
         buffer.seek(0)
         
         return StreamingResponse(buffer, media_type="audio/wav", headers={"Content-Disposition": "attachment; filename=narration.wav"})
