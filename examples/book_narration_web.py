@@ -98,6 +98,17 @@ async def home():
                     <input type="file" name="ref_audio" id="ref_audio" accept="audio/*" required>
                 </div>
                 
+                <div class="form-group">
+                    <label for="exaggeration">Exaggeration (0.0 - 1.0): <span id="exag-val">0.5</span></label>
+                    <input type="range" name="exaggeration" id="exaggeration" min="0" max="1" step="0.1" value="0.5" oninput="document.getElementById('exag-val').innerText = this.value">
+                </div>
+
+                <div class="form-group">
+                    <label for="cfg_weight">CFG Weight (0.0 - 1.0): <span id="cfg-val">0.5</span></label>
+                    <input type="range" name="cfg_weight" id="cfg_weight" min="0" max="1" step="0.1" value="0.5" oninput="document.getElementById('cfg-val').innerText = this.value">
+                    <small style="color: grey; display: block; margin-top: 5px;">Higher CFG follows the voice style more strictly but is slower.</small>
+                </div>
+                
                 <button type="submit">Generate Narration</button>
             </form>
             <div id="loading">
@@ -110,7 +121,12 @@ async def home():
     return html_content
 
 @app.post("/generate")
-async def generate(text: str = Form(...), ref_audio: UploadFile = File(...)):
+async def generate(
+    text: str = Form(...), 
+    ref_audio: UploadFile = File(...),
+    exaggeration: float = Form(0.5),
+    cfg_weight: float = Form(0.5)
+):
     global model, device
     
     if not text:
@@ -150,7 +166,9 @@ async def generate(text: str = Form(...), ref_audio: UploadFile = File(...)):
                 audios = model.generate_batch(
                     texts=batch_texts,
                     language_id="en", # Defaulting to English
-                    audio_prompt_path=prompts
+                    audio_prompt_path=prompts,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight
                 )
             
             for audio in audios:
