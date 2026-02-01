@@ -661,7 +661,7 @@ class ChatterboxMultilingualTTS:
                 valid_wav_len = int((valid_token_lens[i] + BUFFER_TOKENS) / 25.0 * 22050.0)
                 
                 # Clamp to actual generated length
-                valid_wav_len = min(valid_wav_len, wav_batch.shape[1])
+                valid_wav_len = min(valid_wav_len, wav_batch.shape[2])
                 # Actually HiFiGAN upsamples exactly.
                 # Current s3gen returns padded batch.
                 
