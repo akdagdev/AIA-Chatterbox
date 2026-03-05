@@ -281,11 +281,30 @@ class ChatterboxMultilingualTTS:
         t3_cond, s3gen_ref_dict = self.get_conditioning_for_prompt(wav_fpath, exaggeration)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
+    def extract_voice_embedding(self, wav_fpath, exaggeration=0.5) -> Conditionals:
+        """
+        Extract a reusable voice embedding (Conditionals) from a reference audio file.
+        This is a standalone utility — it does NOT modify self.conds.
+        
+        Args:
+            wav_fpath: Path to the reference audio file (wav, mp3, etc.)
+            exaggeration: Emotion/emphasis level (0.0 - 1.0)
+            
+        Returns:
+            Conditionals: A portable voice embedding object that can be:
+                - Passed to generate(conditionals=...) or SpeechRequest(conditionals=...)
+                - Saved to disk via .save(path) and loaded via Conditionals.load(path)
+                - Cached in memory for repeated use
+        """
+        t3_cond, s3gen_ref_dict = self.get_conditioning_for_prompt(wav_fpath, exaggeration)
+        return Conditionals(t3_cond, s3gen_ref_dict)
+
     def generate(
         self,
         text,
         language_id,
         audio_prompt_path=None,
+        conditionals: Conditionals = None,
         exaggeration=0.5,
         cfg_weight=0.5,
         temperature=0.8,
@@ -306,19 +325,27 @@ class ChatterboxMultilingualTTS:
                 f"Supported languages: {supported_langs}"
             )
         
-        if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        # Resolve conditionals into a local variable (thread-safe)
+        if conditionals is not None:
+            conds = conditionals
+        elif audio_prompt_path:
+            t3_cond, s3gen_ref_dict = self.get_conditioning_for_prompt(audio_prompt_path, exaggeration)
+            conds = Conditionals(t3_cond, s3gen_ref_dict)
         else:
-            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            assert self.conds is not None, "Please specify `conditionals`, `audio_prompt_path`, or call `prepare_conditionals` first"
+            conds = self.conds
 
-        # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
-            _cond: T3Cond = self.conds.t3
-            self.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
-            ).to(device=self.device)
+        # Update exaggeration if needed (on local copy, not self)
+        if exaggeration != conds.t3.emotion_adv[0, 0, 0]:
+            _cond: T3Cond = conds.t3
+            conds = Conditionals(
+                t3=T3Cond(
+                    speaker_emb=_cond.speaker_emb,
+                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                    emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
+                ).to(device=self.device),
+                gen=conds.gen,
+            )
 
         # Norm and tokenize text
         text = punc_norm(text)
@@ -332,9 +359,9 @@ class ChatterboxMultilingualTTS:
 
         with torch.inference_mode():
             speech_tokens = self.t3.inference(
-                t3_cond=self.conds.t3,
+                t3_cond=conds.t3,
                 text_tokens=text_tokens,
-                max_new_tokens=max_new_tokens,  # TODO: use the value in config
+                max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 max_cache_len=max_cache_len,
@@ -352,7 +379,7 @@ class ChatterboxMultilingualTTS:
 
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
-                ref_dict=self.conds.gen,
+                ref_dict=conds.gen,
             )
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
