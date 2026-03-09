@@ -134,7 +134,7 @@ class S3Token2Mel(torch.nn.Module):
             ref_wav_24 = get_resampler(ref_sr, S3GEN_SR, device)(ref_wav)
 
         ref_mels_24 = self.mel_extractor(ref_wav_24).transpose(1, 2).to(device)
-        ref_mels_24_len = None
+        ref_mels_24_len = torch.tensor([ref_mels_24.size(1)], dtype=torch.long, device=device)
 
         # Resample to 16kHz
         ref_wav_16 = get_resampler(ref_sr, S3_SR, device)(ref_wav).to(device)
