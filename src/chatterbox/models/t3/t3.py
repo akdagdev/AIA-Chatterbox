@@ -257,24 +257,7 @@ class T3(nn.Module):
             self.patched_model = patched_model
             self.compiled = True
 
-    def get_cache(self, config, max_batch_size, max_cache_len, device, dtype):
-        if hasattr(self, 'backend_cache'):
-            if self.backend_cache_params['max_batch_size'] == max_batch_size and \
-                self.backend_cache_params['max_cache_len'] == max_cache_len and \
-                self.backend_cache_params['dtype'] == dtype and \
-                self.backend_cache_params['device'] == device:
-                self.backend_cache.reset()
-                return self.backend_cache
-            else:
-                del self.backend_cache
-                # Cache params changed — invalidate CUDA graph wrappers that captured
-                # the old cache's tensor addresses. They will be recreated on next use
-                # with the correct (new) cache, preventing stale KV reads → noise.
-                if hasattr(self, 'cudagraph_wrapper'):
-                    del self.cudagraph_wrapper
-                if hasattr(self, 'batch_cudagraph_wrapper'):
-                    del self.batch_cudagraph_wrapper
-
+    def _make_cache(self, config, max_batch_size, max_cache_len, device, dtype):
         cache = StaticCache(
             config=config,
             max_batch_size=max_batch_size,
@@ -282,15 +265,55 @@ class T3(nn.Module):
             device=device,
             dtype=dtype,
         )
-        # save parameters in t3 since huggingface fails deprecation standards.
-        self.backend_cache_params = {
+        return cache, {
             'max_batch_size': max_batch_size,
             'max_cache_len': max_cache_len,
             'device': device,
             'dtype': dtype,
         }
-        self.backend_cache = cache
-        return cache
+
+    def _params_match(self, stored, max_batch_size, max_cache_len, device, dtype):
+        return (
+            stored['max_batch_size'] == max_batch_size and
+            stored['max_cache_len'] == max_cache_len and
+            stored['dtype'] == dtype and
+            stored['device'] == device
+        )
+
+    def get_cache(self, config, max_batch_size, max_cache_len, device, dtype):
+        """Direct-path cache (max_batch_size is always 2 with CFG).
+        Kept for backward compatibility — delegates to get_cache_direct()."""
+        return self.get_cache_direct(config, max_batch_size, max_cache_len, device, dtype)
+
+    def get_cache_direct(self, config, max_batch_size, max_cache_len, device, dtype):
+        """Cache for inference() — params never change after warmup (bs always 2).
+        cudagraph_wrapper is never invalidated by batch calls."""
+        if hasattr(self, '_direct_cache'):
+            if self._params_match(self._direct_cache_params, max_batch_size, max_cache_len, device, dtype):
+                self._direct_cache.reset()
+                return self._direct_cache
+            del self._direct_cache
+            # Direct cache params changed — invalidate direct wrapper only.
+            if hasattr(self, 'cudagraph_wrapper'):
+                del self.cudagraph_wrapper
+        self._direct_cache, self._direct_cache_params = self._make_cache(
+            config, max_batch_size, max_cache_len, device, dtype)
+        return self._direct_cache
+
+    def get_cache_batch(self, config, max_batch_size, max_cache_len, device, dtype):
+        """Cache for inference_batch() — max_batch_size varies with request count.
+        Only invalidates batch_cudagraph_wrapper, never the direct wrapper."""
+        if hasattr(self, '_batch_cache'):
+            if self._params_match(self._batch_cache_params, max_batch_size, max_cache_len, device, dtype):
+                self._batch_cache.reset()
+                return self._batch_cache
+            del self._batch_cache
+            # Batch cache params changed — invalidate batch wrapper only.
+            if hasattr(self, 'batch_cudagraph_wrapper'):
+                del self.batch_cudagraph_wrapper
+        self._batch_cache, self._batch_cache_params = self._make_cache(
+            config, max_batch_size, max_cache_len, device, dtype)
+        return self._batch_cache
 
     def get_speech_pos_embedding_cache(self, max_gen_tokens, dtype):
         if not hasattr(self, '_speech_pos_embedding_cache') or self._speech_pos_embedding_cache.size(0) < max_gen_tokens:
@@ -450,7 +473,7 @@ class T3(nn.Module):
         generated_ids = torch.full((1, bos_len + TOKEN_LIMIT), PAD_TOKEN_ID, dtype=torch.long, device=device)
         generated_ids[0, :bos_len] = bos_token
 
-        kv_cache = self.get_cache(
+        kv_cache = self.get_cache_direct(
             config=self.patched_model.config,
             max_batch_size=effective_batch_size,
             max_cache_len=max_cache_len,
@@ -648,7 +671,7 @@ class T3(nn.Module):
         generated_ids[:, 0] = self.hp.start_speech_token
 
         # KV Cache with proper batch size
-        kv_cache = self.get_cache(
+        kv_cache = self.get_cache_batch(
             config=self.patched_model.config,
             max_batch_size=effective_batch_size,
             max_cache_len=max_cache_len,
