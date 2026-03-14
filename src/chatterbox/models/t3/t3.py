@@ -301,19 +301,27 @@ class T3(nn.Module):
         return self._direct_cache
 
     def get_cache_batch(self, config, max_batch_size, max_cache_len, device, dtype):
-        """Cache pool for inference_batch() — one StaticCache per effective_batch_size.
-        Each batch size keeps its own pre-allocated cache so switching between sizes
-        (e.g. 2-item batch → 8-item batch) never invalidates another size's wrapper.
-        Runtime CUDA graph captures are eliminated after warmup covers all needed sizes."""
-        if not hasattr(self, '_batch_cache_pool'):
-            self._batch_cache_pool = {}
-        key = (max_batch_size, max_cache_len, str(device), str(dtype))
-        if key in self._batch_cache_pool:
-            self._batch_cache_pool[key].reset()
-            return self._batch_cache_pool[key]
-        cache, _ = self._make_cache(config, max_batch_size, max_cache_len, device, dtype)
-        self._batch_cache_pool[key] = cache
-        return cache
+        """Single shared cache for all batch sizes, allocated at the maximum capacity seen.
+
+        All per-size CUDA graph wrappers reference the same cache object — only one
+        StaticCache lives in VRAM regardless of how many batch sizes are warmed up.
+        A smaller batch size reuses the oversized cache (extra rows are untouched).
+        If a batch size larger than the current max arrives, cache is recreated and
+        all wrappers are invalidated (rare after proper warmup with max size first)."""
+        if hasattr(self, '_batch_cache'):
+            stored = self._batch_cache_params
+            if stored['max_batch_size'] >= max_batch_size and \
+               stored['max_cache_len'] == max_cache_len and \
+               stored['dtype'] == dtype and stored['device'] == device:
+                self._batch_cache.reset()
+                return self._batch_cache
+            # Larger batch size needed — recreate and drop all old wrappers
+            del self._batch_cache
+            if hasattr(self, '_batch_cudagraph_wrappers'):
+                del self._batch_cudagraph_wrappers
+        self._batch_cache, self._batch_cache_params = self._make_cache(
+            config, max_batch_size, max_cache_len, device, dtype)
+        return self._batch_cache
 
     def get_speech_pos_embedding_cache(self, max_gen_tokens, dtype):
         if not hasattr(self, '_speech_pos_embedding_cache') or self._speech_pos_embedding_cache.size(0) < max_gen_tokens:
