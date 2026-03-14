@@ -301,24 +301,14 @@ class T3(nn.Module):
         return self._direct_cache
 
     def get_cache_batch(self, config, max_batch_size, max_cache_len, device, dtype):
-        """Single shared cache for all batch sizes, allocated at the maximum capacity seen.
-
-        All per-size CUDA graph wrappers reference the same cache object — only one
-        StaticCache lives in VRAM regardless of how many batch sizes are warmed up.
-        A smaller batch size reuses the oversized cache (extra rows are untouched).
-        If a batch size larger than the current max arrives, cache is recreated and
-        all wrappers are invalidated (rare after proper warmup with max size first)."""
+        """Cache for inference_batch() — single slot, recreated when batch size changes.
+        Batch path uses eager mode (no CUDA graphs), so cache recreation is safe and
+        does not conflict with concurrent CUDA operations like STT inference."""
         if hasattr(self, '_batch_cache'):
-            stored = self._batch_cache_params
-            if stored['max_batch_size'] >= max_batch_size and \
-               stored['max_cache_len'] == max_cache_len and \
-               stored['dtype'] == dtype and stored['device'] == device:
+            if self._params_match(self._batch_cache_params, max_batch_size, max_cache_len, device, dtype):
                 self._batch_cache.reset()
                 return self._batch_cache
-            # Larger batch size needed — recreate and drop all old wrappers
             del self._batch_cache
-            if hasattr(self, '_batch_cudagraph_wrappers'):
-                del self._batch_cudagraph_wrappers
         self._batch_cache, self._batch_cache_params = self._make_cache(
             config, max_batch_size, max_cache_len, device, dtype)
         return self._batch_cache
@@ -707,45 +697,18 @@ class T3(nn.Module):
         # Pre-allocate stop_token_tensor for CUDA graph compatibility
         pre_stop_token_tensor = torch.tensor([[self.hp.stop_speech_token]], device=device, dtype=torch.long)
 
-        # Select generation backend
+        # Batch path always uses eager mode — no CUDA graph captures.
+        # This avoids CUDA graph capture conflicts with concurrent STT inference
+        # and eliminates VRAM overhead from per-batch-size StaticCache/wrapper pools.
+        # Batching itself provides sufficient GPU utilization; the ~10-20% CUDA graph
+        # speedup is not worth the complexity and crash risk for the batch path.
+        # Direct path (inference()) retains CUDA graphs for latency-critical realtime TTS.
+        generate_token_batch = _generate_token_batch_variants["eager"]
         is_cuda = device.type == "cuda"
-        
-        if is_cuda:
-            # Use CUDA Graphs for optimized generation.
-            # One wrapper per input_batch_size — switching batch sizes never
-            # destroys a pre-captured graph, eliminating all runtime captures
-            # after warmup covers sizes 1..MAX_BATCH_SIZE.
-            if not hasattr(self, "_batch_cudagraph_wrappers"):
-                self._batch_cudagraph_wrappers = {}
-            if input_batch_size not in self._batch_cudagraph_wrappers:
-                from .t3_cuda_graphs import T3BatchStepCUDAGraphWrapper
-                self._batch_cudagraph_wrappers[input_batch_size] = T3BatchStepCUDAGraphWrapper(
-                    generate_t3_token_batch,
-                    self.patched_model,
-                    kv_cache,
-                    self.repetition_penalty_processor,
-                    self.min_p_warper,
-                    self.top_p_warper,
-                    input_batch_size,
-                    self.hp.stop_speech_token,
-                    pre_stop_token_tensor,
-                )
-            self.batch_cudagraph_wrapper = self._batch_cudagraph_wrappers[input_batch_size]
-            self.batch_cudagraph_wrapper.guard()
-            generate_token_batch = self.batch_cudagraph_wrapper
-        else:
-            generate_token_batch = _generate_token_batch_variants["eager"]
 
         for i in tqdm(range(max_new_tokens), desc="Batch Sampling", dynamic_ncols=True):
             i_tensor = indices[i]
             
-            # Use bucketing for CUDA graphs
-            if is_cuda:
-                bucket_size = 250
-                max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT)
-            else:
-                max_position = None
-
             next_token, output_logits = generate_token_batch(
                 self._speech_embedding_cache,
                 output_logits,
@@ -764,7 +727,7 @@ class T3(nn.Module):
                 finished_mask,
                 stop_token_id=self.hp.stop_speech_token,
                 stop_token_tensor=pre_stop_token_tensor,
-                max_position=max_position,
+                max_position=None,
             )
             output_logits = output_logits.clone()
 
