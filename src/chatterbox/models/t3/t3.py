@@ -301,19 +301,19 @@ class T3(nn.Module):
         return self._direct_cache
 
     def get_cache_batch(self, config, max_batch_size, max_cache_len, device, dtype):
-        """Cache for inference_batch() — max_batch_size varies with request count.
-        Only invalidates batch_cudagraph_wrapper, never the direct wrapper."""
-        if hasattr(self, '_batch_cache'):
-            if self._params_match(self._batch_cache_params, max_batch_size, max_cache_len, device, dtype):
-                self._batch_cache.reset()
-                return self._batch_cache
-            del self._batch_cache
-            # Batch cache params changed — invalidate batch wrapper only.
-            if hasattr(self, 'batch_cudagraph_wrapper'):
-                del self.batch_cudagraph_wrapper
-        self._batch_cache, self._batch_cache_params = self._make_cache(
-            config, max_batch_size, max_cache_len, device, dtype)
-        return self._batch_cache
+        """Cache pool for inference_batch() — one StaticCache per effective_batch_size.
+        Each batch size keeps its own pre-allocated cache so switching between sizes
+        (e.g. 2-item batch → 8-item batch) never invalidates another size's wrapper.
+        Runtime CUDA graph captures are eliminated after warmup covers all needed sizes."""
+        if not hasattr(self, '_batch_cache_pool'):
+            self._batch_cache_pool = {}
+        key = (max_batch_size, max_cache_len, str(device), str(dtype))
+        if key in self._batch_cache_pool:
+            self._batch_cache_pool[key].reset()
+            return self._batch_cache_pool[key]
+        cache, _ = self._make_cache(config, max_batch_size, max_cache_len, device, dtype)
+        self._batch_cache_pool[key] = cache
+        return cache
 
     def get_speech_pos_embedding_cache(self, max_gen_tokens, dtype):
         if not hasattr(self, '_speech_pos_embedding_cache') or self._speech_pos_embedding_cache.size(0) < max_gen_tokens:
@@ -703,11 +703,15 @@ class T3(nn.Module):
         is_cuda = device.type == "cuda"
         
         if is_cuda:
-            # Use CUDA Graphs for optimized generation
-            if not hasattr(self, "batch_cudagraph_wrapper") or \
-               self.batch_cudagraph_wrapper.input_batch_size != input_batch_size:
+            # Use CUDA Graphs for optimized generation.
+            # One wrapper per input_batch_size — switching batch sizes never
+            # destroys a pre-captured graph, eliminating all runtime captures
+            # after warmup covers sizes 1..MAX_BATCH_SIZE.
+            if not hasattr(self, "_batch_cudagraph_wrappers"):
+                self._batch_cudagraph_wrappers = {}
+            if input_batch_size not in self._batch_cudagraph_wrappers:
                 from .t3_cuda_graphs import T3BatchStepCUDAGraphWrapper
-                self.batch_cudagraph_wrapper = T3BatchStepCUDAGraphWrapper(
+                self._batch_cudagraph_wrappers[input_batch_size] = T3BatchStepCUDAGraphWrapper(
                     generate_t3_token_batch,
                     self.patched_model,
                     kv_cache,
@@ -718,6 +722,7 @@ class T3(nn.Module):
                     self.hp.stop_speech_token,
                     pre_stop_token_tensor,
                 )
+            self.batch_cudagraph_wrapper = self._batch_cudagraph_wrappers[input_batch_size]
             self.batch_cudagraph_wrapper.guard()
             generate_token_batch = self.batch_cudagraph_wrapper
         else:
