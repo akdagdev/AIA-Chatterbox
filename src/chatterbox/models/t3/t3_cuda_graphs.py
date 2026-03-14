@@ -3,6 +3,13 @@ from typing import Optional, Tuple, Callable, Any, Dict
 
 TOKEN_LIMIT = 1500
 
+# Set externally by the host application (e.g. AI-Server) to prevent CUDA graph
+# captures from running concurrently with other CUDA operations (like STT inference).
+# When set, the lock is acquired ONLY during graph capture (~10-50ms per bucket),
+# NOT during graph replay. This allows normal TTS generation and STT to run freely
+# in parallel, blocking STT only during the brief first-time capture of each bucket.
+CUDA_CAPTURE_LOCK = None
+
 
 def get_next_bucket(
     seq_len: int, bucket_size: int = 250, max_bucket: int = TOKEN_LIMIT
@@ -83,50 +90,57 @@ class T3StepCUDAGraphWrapper:
             f"Capturing CUDA graph for bucket {bucket_key} (max_position: {max_position})"
         )
 
-        # Create new graph for this bucket
-        self._bucket_graphs[bucket_key] = torch.cuda.CUDAGraph()
+        lock = CUDA_CAPTURE_LOCK
+        if lock:
+            lock.acquire()
+        try:
+            # Create new graph for this bucket
+            self._bucket_graphs[bucket_key] = torch.cuda.CUDAGraph()
 
-        # Initialize static tensors dictionary for this bucket
-        static_tensors = {}
+            # Initialize static tensors dictionary for this bucket
+            static_tensors = {}
 
-        # Clone static tensors for this bucket
-        static_tensors["speech_embedding_cache"] = speech_embedding_cache.clone()
-        static_tensors["output_logits"] = output_logits.clone()
-        static_tensors["i_tensor"] = i_tensor.clone()
-        static_tensors["batch_idx"] = batch_idx.clone()
-        static_tensors["speech_pos_embedding_cache"] = (
-            speech_pos_embedding_cache.clone()
-        )
-        static_tensors["generated_ids"] = generated_ids
-        static_tensors["cfg_weight"] = cfg_weight
-        static_tensors["temperature"] = temperature
-        static_tensors["stride_length"] = stride_length
-        static_tensors["max_position"] = bucket_key
+            # Clone static tensors for this bucket
+            static_tensors["speech_embedding_cache"] = speech_embedding_cache.clone()
+            static_tensors["output_logits"] = output_logits.clone()
+            static_tensors["i_tensor"] = i_tensor.clone()
+            static_tensors["batch_idx"] = batch_idx.clone()
+            static_tensors["speech_pos_embedding_cache"] = (
+                speech_pos_embedding_cache.clone()
+            )
+            static_tensors["generated_ids"] = generated_ids
+            static_tensors["cfg_weight"] = cfg_weight
+            static_tensors["temperature"] = temperature
+            static_tensors["stride_length"] = stride_length
+            static_tensors["max_position"] = bucket_key
 
-        # Capture the graph
-        with torch.inference_mode():
-            with torch.cuda.graph(self._bucket_graphs[bucket_key]):
-                static_tensors["out_1"], static_tensors["out_2"] = self.generate_token(
-                    static_tensors["speech_embedding_cache"],
-                    static_tensors["output_logits"],
-                    static_tensors["i_tensor"],
-                    static_tensors["batch_idx"],
-                    static_tensors["speech_pos_embedding_cache"],
-                    static_tensors["generated_ids"],
-                    static_tensors["cfg_weight"],
-                    static_tensors["temperature"],
-                    self.repetition_penalty_processor,
-                    self.min_p_warper,
-                    self.top_p_warper,
-                    self.patched_model,
-                    self.kv_cache,  # Shared kv_cache
-                    static_tensors["stride_length"],
-                    static_tensors["max_position"],
-                    self.alignment_stream_analyzer,
-                )
+            # Capture the graph
+            with torch.inference_mode():
+                with torch.cuda.graph(self._bucket_graphs[bucket_key]):
+                    static_tensors["out_1"], static_tensors["out_2"] = self.generate_token(
+                        static_tensors["speech_embedding_cache"],
+                        static_tensors["output_logits"],
+                        static_tensors["i_tensor"],
+                        static_tensors["batch_idx"],
+                        static_tensors["speech_pos_embedding_cache"],
+                        static_tensors["generated_ids"],
+                        static_tensors["cfg_weight"],
+                        static_tensors["temperature"],
+                        self.repetition_penalty_processor,
+                        self.min_p_warper,
+                        self.top_p_warper,
+                        self.patched_model,
+                        self.kv_cache,  # Shared kv_cache
+                        static_tensors["stride_length"],
+                        static_tensors["max_position"],
+                        self.alignment_stream_analyzer,
+                    )
 
-        # Store static tensors for this bucket
-        self._bucket_static_tensors[bucket_key] = static_tensors
+            # Store static tensors for this bucket
+            self._bucket_static_tensors[bucket_key] = static_tensors
+        finally:
+            if lock:
+                lock.release()
         self._captured_buckets.add(bucket_key)
 
     def __call__(
@@ -266,45 +280,52 @@ class T3BatchStepCUDAGraphWrapper:
     ) -> None:
         print(f"Capturing CUDA graph for batch bucket {bucket_key}")
 
-        self._bucket_graphs[bucket_key] = torch.cuda.CUDAGraph()
-        static_tensors = {}
+        lock = CUDA_CAPTURE_LOCK
+        if lock:
+            lock.acquire()
+        try:
+            self._bucket_graphs[bucket_key] = torch.cuda.CUDAGraph()
+            static_tensors = {}
 
-        static_tensors["speech_embedding_cache"] = speech_embedding_cache.clone()
-        static_tensors["output_logits"] = output_logits.clone()
-        static_tensors["i_tensor"] = i_tensor.clone()
-        static_tensors["batch_idx"] = batch_idx.clone()
-        static_tensors["speech_pos_embedding_cache"] = speech_pos_embedding_cache.clone()
-        static_tensors["generated_ids"] = generated_ids.clone()
-        static_tensors["cfg_weight"] = cfg_weight
-        static_tensors["temperature"] = temperature
-        static_tensors["finished_mask"] = finished_mask.clone()
-        static_tensors["max_position"] = bucket_key
+            static_tensors["speech_embedding_cache"] = speech_embedding_cache.clone()
+            static_tensors["output_logits"] = output_logits.clone()
+            static_tensors["i_tensor"] = i_tensor.clone()
+            static_tensors["batch_idx"] = batch_idx.clone()
+            static_tensors["speech_pos_embedding_cache"] = speech_pos_embedding_cache.clone()
+            static_tensors["generated_ids"] = generated_ids.clone()
+            static_tensors["cfg_weight"] = cfg_weight
+            static_tensors["temperature"] = temperature
+            static_tensors["finished_mask"] = finished_mask.clone()
+            static_tensors["max_position"] = bucket_key
 
-        with torch.inference_mode():
-            with torch.cuda.graph(self._bucket_graphs[bucket_key]):
-                static_tensors["out_1"], static_tensors["out_2"] = self.generate_token_batch(
-                    static_tensors["speech_embedding_cache"],
-                    static_tensors["output_logits"],
-                    static_tensors["i_tensor"],
-                    static_tensors["batch_idx"],
-                    static_tensors["speech_pos_embedding_cache"],
-                    static_tensors["generated_ids"],
-                    static_tensors["cfg_weight"],
-                    static_tensors["temperature"],
-                    self.repetition_penalty_processor,
-                    self.min_p_warper,
-                    self.top_p_warper,
-                    self.patched_model,
-                    self.kv_cache,
-                    self.input_batch_size,
-                    static_tensors["finished_mask"],
-                    self.stop_token_id,
-                    self.stop_token_tensor,  # Use pre-allocated tensor
-                    static_tensors["max_position"],
-                )
+            with torch.inference_mode():
+                with torch.cuda.graph(self._bucket_graphs[bucket_key]):
+                    static_tensors["out_1"], static_tensors["out_2"] = self.generate_token_batch(
+                        static_tensors["speech_embedding_cache"],
+                        static_tensors["output_logits"],
+                        static_tensors["i_tensor"],
+                        static_tensors["batch_idx"],
+                        static_tensors["speech_pos_embedding_cache"],
+                        static_tensors["generated_ids"],
+                        static_tensors["cfg_weight"],
+                        static_tensors["temperature"],
+                        self.repetition_penalty_processor,
+                        self.min_p_warper,
+                        self.top_p_warper,
+                        self.patched_model,
+                        self.kv_cache,
+                        self.input_batch_size,
+                        static_tensors["finished_mask"],
+                        self.stop_token_id,
+                        self.stop_token_tensor,  # Use pre-allocated tensor
+                        static_tensors["max_position"],
+                    )
 
-        self._bucket_static_tensors[bucket_key] = static_tensors
-        self._captured_buckets.add(bucket_key)
+            self._bucket_static_tensors[bucket_key] = static_tensors
+            self._captured_buckets.add(bucket_key)
+        finally:
+            if lock:
+                lock.release()
 
     def __call__(
         self,
