@@ -267,6 +267,13 @@ class T3(nn.Module):
                 return self.backend_cache
             else:
                 del self.backend_cache
+                # Cache params changed — invalidate CUDA graph wrappers that captured
+                # the old cache's tensor addresses. They will be recreated on next use
+                # with the correct (new) cache, preventing stale KV reads → noise.
+                if hasattr(self, 'cudagraph_wrapper'):
+                    del self.cudagraph_wrapper
+                if hasattr(self, 'batch_cudagraph_wrapper'):
+                    del self.batch_cudagraph_wrapper
 
         cache = StaticCache(
             config=config,
