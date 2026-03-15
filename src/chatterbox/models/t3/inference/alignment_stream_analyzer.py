@@ -106,8 +106,10 @@ class AlignmentStreamAnalyzer:
             # subsequent chunks have 1 frame due to KV-caching
             A_chunk = aligned_attn[:, i:j].clone().cpu() # (1, S)
 
-        # TODO: monotonic masking; could have issue b/c spaces are often skipped.
-        A_chunk[:, self.curr_frame_pos + 1:] = 0
+        # Monotonic masking: use text_position with margin instead of frame_pos
+        # to handle spaces and skipped tokens (text_position can jump by >1)
+        mask_cutoff = min(self.text_position + 4, A_chunk.shape[1])
+        A_chunk[:, mask_cutoff:] = 0
 
 
         self.alignment = torch.cat((self.alignment, A_chunk), dim=0)

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List, Union, Optional, Dict
 from pathlib import Path
 import os
+import threading
 
 import librosa
 import torch
@@ -131,7 +132,6 @@ class Conditionals:
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
 @dataclass
-@dataclass
 class SpeechRequest:
     text: str
     audio_prompt_path: Optional[str] = None
@@ -161,6 +161,7 @@ class ChatterboxMultilingualTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
+        self._batch_lock = threading.Lock()
 
         
         # Safely initialize watermarker
@@ -182,7 +183,7 @@ class ChatterboxMultilingualTTS:
         return SUPPORTED_LANGUAGES.copy()
 
     @classmethod
-    def from_local(cls, ckpt_dir, device) -> 'ChatterboxMultilingualTTS':
+    def from_local(cls, ckpt_dir, device, num_s3gen_copies=4) -> 'ChatterboxMultilingualTTS':
         ckpt_dir = Path(ckpt_dir)
 
         ve = VoiceEncoder()
@@ -204,11 +205,10 @@ class ChatterboxMultilingualTTS:
         # Load checkpoint once
         s3gen_state = torch.load(ckpt_dir / "s3gen.pt", map_location=device, weights_only=True)
         
-        # Create 4 S3Gen copies for parallel inference
+        # Create S3Gen copies for parallel inference
         # First copy stays FP32 for embed_ref compatibility, others use FP16 for speed
-        NUM_S3GEN_COPIES = 4
         s3gen_copies = []
-        for i in range(NUM_S3GEN_COPIES):
+        for i in range(num_s3gen_copies):
             s3gen_copy = S3Gen()
             s3gen_copy.load_state_dict(s3gen_state)
             s3gen_copy.to(device)
@@ -231,17 +231,17 @@ class ChatterboxMultilingualTTS:
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds, s3gen_copies=s3gen_copies)
 
     @classmethod
-    def from_pretrained(cls, device: torch.device) -> 'ChatterboxMultilingualTTS':
+    def from_pretrained(cls, device: torch.device, num_s3gen_copies=4) -> 'ChatterboxMultilingualTTS':
         ckpt_dir = Path(
             snapshot_download(
                 repo_id=REPO_ID,
                 repo_type="model",
-                revision="main", 
+                revision="main",
                 allow_patterns=["ve.pt", "t3_mtl23ls_v2.safetensors", "s3gen.pt", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"],
                 token=os.getenv("HF_TOKEN"),
             )
         )
-        return cls.from_local(ckpt_dir, device)
+        return cls.from_local(ckpt_dir, device, num_s3gen_copies=num_s3gen_copies)
     
     def get_conditioning_for_prompt(self, wav_fpath, exaggeration=0.5):
         """
@@ -410,6 +410,42 @@ class ChatterboxMultilingualTTS:
         Returns:
             List of torch.Tensor, each containing generated audio waveform
         """
+        if not self._batch_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "generate_batch() is already running from another thread. "
+                "This method is NOT thread-safe — use a single worker or queue."
+            )
+        try:
+            return self._generate_batch_impl(
+                texts=texts,
+                language_id=language_id,
+                audio_prompt_path=audio_prompt_path,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                max_cache_len=max_cache_len,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            )
+        finally:
+            self._batch_lock.release()
+
+    def _generate_batch_impl(
+        self,
+        texts: list,
+        language_id: str,
+        audio_prompt_path: Union[str, List[str]] = None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        max_new_tokens=1000,
+        max_cache_len=1500,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+    ):
         batch_size = len(texts)
         if batch_size == 0:
             return []

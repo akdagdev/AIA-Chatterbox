@@ -96,22 +96,35 @@ class S3Tokenizer(S3TokenizerV2):
     ) -> Tuple[torch.Tensor, torch.LongTensor]:
         """
         NOTE: mel-spec has a hop size of 160 points (100 frame/sec).
-        FIXME: this class inherits `nn.Module` but doesn't accept `torch.Tensor` and handles a list of wavs one by one, which is unexpected.
 
         Args
         ----
-        - `wavs`: 16 kHz speech audio
+        - `wavs`: 16 kHz speech audio (list of numpy arrays or tensors)
         - `max_len` max length to truncate the output sequence to (25 token/sec).
         NOTE: please pad the waveform if longer sequence is needed.
         """
         processed_wavs = self._prepare_audio(wavs)
-        mels, mel_lens = [], []
-        for wav in processed_wavs:
-            wav = wav.to(self.device)
-            mel = self.log_mel_spectrogram(wav)  # [B=1, F, T]
+
+        # Batch mel computation: pad waveforms, compute STFT in one call
+        wav_lens = [w.shape[-1] for w in processed_wavs]
+        max_wav_len = max(wav_lens)
+
+        batched_wavs = torch.zeros(len(processed_wavs), max_wav_len, device=self.device)
+        for i, wav in enumerate(processed_wavs):
+            wav_1d = wav.squeeze(0) if wav.dim() == 2 else wav
+            batched_wavs[i, :wav_1d.shape[-1]] = wav_1d.to(self.device)
+
+        # Single batched STFT call for all waveforms
+        all_mels = self.log_mel_spectrogram(batched_wavs)  # [B, F, T]
+
+        # Slice each mel to its valid length and optionally truncate
+        mels = []
+        for i in range(len(processed_wavs)):
+            mel_len = int(np.ceil(wav_lens[i] / S3_HOP))
+            mel = all_mels[i, :, :mel_len]
             if max_len is not None:
                 mel = mel[..., :max_len * 4]  # num_mel_frames = 4 * num_tokens
-            mels.append(mel.squeeze(0))
+            mels.append(mel)
 
         mels, mel_lens = padding(mels)
         if accelerator is None:

@@ -18,8 +18,12 @@ Primary API: `ChatterboxMultilingualTTS` in `src/chatterbox/mtl_tts.py`. The Eng
 pip install -e .
 uv pip install -e .
 
-# Run tests (manual runner, no pytest)
-python tests/test_batch_tokenizer.py
+# Run tests
+pytest                               # all tests
+pytest tests/test_mtl_tts.py         # unit tests (no GPU needed)
+pytest tests/test_tokenizer.py       # tokenizer tests (downloads vocab from HF)
+pytest -m "not gpu"                  # skip GPU-requiring tests
+python tests/test_batch_tokenizer.py # legacy manual runner
 
 # Run examples
 python example_tts.py
