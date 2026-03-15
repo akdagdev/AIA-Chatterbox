@@ -1,290 +1,108 @@
-# CLAUDE.md — AIA-Chatterbox
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Overview
 
-Multilingual TTS library (23 languages). Two-stage pipeline:
+AIA-Chatterbox is a multilingual TTS library (23 languages) forked from ResembleAI/chatterbox, customized for the white-ai ecosystem. It is installed as an editable package into AI-Server's venv. Two-stage pipeline:
 
-1. **T3** — Llama-based text → discrete speech tokens (520M params)
-2. **S3Gen** — Speech tokens → waveform via flow-matching diffusion + HiFiGAN vocoder
+1. **T3** — Llama-3 backbone (hidden=1536, 520M params): text → discrete speech tokens
+2. **S3Gen** — Flow-matching diffusion + HiFiGAN vocoder: speech tokens → 24kHz waveform
 
-Installed as a package into AI-Server's venv: `pip install -e .`
+Primary API: `ChatterboxMultilingualTTS` in `src/chatterbox/mtl_tts.py`. The English-only `ChatterboxTTS` (tts.py) and voice conversion `ChatterboxVC` (vc.py) are **not used by AI-Server**.
 
----
+## Commands
 
-## Package Structure
+```bash
+# Install (editable mode — use uv in AI-Server context)
+pip install -e .
+uv pip install -e .
 
-```
-src/chatterbox/
-├── mtl_tts.py                          # Primary API — ChatterboxMultilingualTTS
-├── tts.py                              # English-only variant (not used by AI-Server)
-├── vc.py                               # Voice conversion (not used by AI-Server)
-└── models/
-    ├── t3/
-    │   ├── t3.py                       # T3 Llama model — inference() + inference_batch()
-    │   ├── t3_cuda_graphs.py           # CUDA graph wrapper + bucketing
-    │   └── modules/
-    │       ├── cond_enc.py             # T3Cond dataclass + CondEncoder
-    │       └── ...
-    ├── s3gen/
-    │   ├── s3gen.py                    # S3Gen vocoder — embed_ref() + inference()
-    │   ├── flow.py                     # CausalMaskedDiffWithXvec (flow matching)
-    │   └── hifigan.py                  # HiFTGenerator vocoder (mel → 24kHz wav)
-    ├── voice_encoder/
-    │   └── voice_encoder.py            # LSTM speaker embedding extractor (256D)
-    └── tokenizers/
-        └── tokenizer.py               # MTLTokenizer — language-aware BPE
+# Run tests (manual runner, no pytest)
+python tests/test_batch_tokenizer.py
+
+# Run examples
+python example_tts.py
+python example_chunked.py        # Sentence-by-sentence with RTF metrics
+python benchmark_batch.py        # Batch performance benchmarking
+
+# Interactive demos
+python gradio_tts_app.py         # English TTS Gradio UI
+python multilingual_app.py       # Multilingual Gradio UI
+python gradio_vc_app.py          # Voice conversion Gradio UI
 ```
 
----
+No linting, formatting, or CI/CD configuration exists in this repo.
 
-## Core API (mtl_tts.py)
+## Architecture
 
-### Key Classes
-
-```python
-ChatterboxMultilingualTTS   # Main model — wraps T3 + S3Gen + VoiceEncoder
-Conditionals                # Portable voice embedding (save/load/to(device))
-SpeechRequest               # Batch generation request wrapper
-T3Cond                      # Low-level T3 conditioning tensors (in cond_enc.py)
-```
-
-### ChatterboxMultilingualTTS
-
-```python
-# Loading
-model = ChatterboxMultilingualTTS.from_pretrained(device)   # From HuggingFace
-model = ChatterboxMultilingualTTS.from_local(ckpt_dir, device)
-
-# Voice embedding
-conds = model.extract_voice_embedding(wav_fpath, exaggeration=0.5) → Conditionals
-model.prepare_conditionals(wav_fpath, exaggeration=0.5)             # Sets self.conds
-
-# Synthesis
-audio = model.generate(text, language_id, conditionals=None, audio_prompt_path=None,
-                        exaggeration=0.5, cfg_weight=0.5, temperature=0.8,
-                        max_new_tokens=1000) → Tensor [1, T]
-
-audios = model.generate_batch(texts: list[SpeechRequest], language_id=None,
-                               cfg_weight=0.5, max_new_tokens=400) → list[Tensor]
-```
-
-**Attribute:** `model.sr = 24000` (output sample rate)
-
-### Conditionals
-
-```python
-@dataclass
-class Conditionals:
-    t3: T3Cond    # Conditioning for T3 (speaker_emb, speech prompt tokens, emotion_adv)
-    gen: dict     # S3Gen ref_dict (prompt_token, prompt_feat, embedding, ...)
-
-    def save(fpath: str)
-    def load(fpath: str, map_location=None) → Conditionals
-    def to(device: str) → Conditionals
-```
-
-Serialization via `torch.save`/`torch.load`. AI-Server uses `serialize_conditionals()` / `deserialize_conditionals()` to convert to/from `bytes` for gRPC transport.
-
-### SpeechRequest
-
-```python
-@dataclass
-class SpeechRequest:
-    text: str
-    audio_prompt_path: Optional[str] = None
-    language_id: Optional[str] = None          # "en", "tr", "fr", etc.
-    conditionals: Optional[Conditionals] = None
-```
-
-### Conditional Priority in generate()
+### Inference Pipeline
 
 ```
-1. conditionals= (explicit Conditionals object)  ← AI-Server always uses this
-2. audio_prompt_path= (extracted on-the-fly)
-3. self.conds (global fallback set via prepare_conditionals)
+text + language_id
+    → MTLTokenizer (language-specific preprocessing + BPE)
+    → T3 (Llama autoregressive, CUDA-graph-accelerated)
+    → speech tokens
+    → S3Gen (flow matching → mel → HiFiGAN)
+    → 24kHz waveform
+    → PerTh watermark (always applied)
 ```
 
----
+### S3Gen Parallel Copies
 
-## T3 Model (models/t3/t3.py)
+`ChatterboxMultilingualTTS` creates **4 S3Gen copies** at load time:
+- Copy 0: FP32 — used exclusively for `embed_ref()` (voice embedding extraction)
+- Copies 1–3: FP16 — used for parallel waveform inference in batch mode
 
-Llama-3 backbone (hidden=1536, speech vocab=8194, text vocab=2454 multilingual).
+### CUDA Graph Acceleration
 
-### Key Methods
+T3 uses CUDA graph capture with bucketed sequence lengths (250, 500, 750, 1000, 1250, 1500). One graph per bucket, reused across calls.
 
-```python
-# Single generation — used by model.generate()
-def inference(t3_cond: T3Cond, text_tokens, max_new_tokens, cfg_weight,
-              temperature, min_p, top_p, repetition_penalty) → speech_tokens
+**Global lock:** `t3_cuda_graphs.CUDA_CAPTURE_LOCK` must be set by the host application (AI-Server) to prevent concurrent CUDA operations during graph capture. The lock is held only during capture (~10-50ms), not during replay.
 
-# Batch generation — used by model.generate_batch()
-def inference_batch(t3_cond: T3Cond, text_tokens, ...) → speech_tokens_list
+**Critical constraint:** A concurrent CUDA operation during graph capture corrupts the graph → `index_copy_(): index out of bounds` → `cudaErrorAssert` → **process crash**. AI-Server pre-captures all 6 single-path graphs at startup via `TTSService.warmup()`. Batch-path graphs are captured lazily (safe because STT no longer runs on GPU concurrently).
 
-# Compile static graph slots for CUDA capture
-def init_patched_model(len_cond=34, text_tokens_size=153)
-```
+### torch.compile
 
-### T3Cond (models/t3/modules/cond_enc.py)
+T3 model is compiled with `torch.compile(mode="reduce-overhead")` at load time. Note: `torch.compile` has a thread-safety TODO in `t3.py:235` — the compilation step itself is not synchronized.
 
-```python
-@dataclass
-class T3Cond:
-    speaker_emb: Tensor                         # (B, 1, 256)  voice encoder output
-    clap_emb: Optional[Tensor] = None           # unused
-    cond_prompt_speech_tokens: Optional[Tensor] = None   # (B, L_prompt) reference tokens
-    cond_prompt_speech_emb: Optional[Tensor] = None      # embeddings of prompt tokens
-    emotion_adv: Optional[Tensor] = 0.5         # exaggeration scalar
-```
+### Conditioning Priority
 
----
+When calling `generate()`, voice conditioning resolves in this order:
+1. `conditionals=` parameter (explicit `Conditionals` object) — AI-Server always uses this
+2. `audio_prompt_path=` (extracts embeddings on-the-fly each call)
+3. `self.conds` (global fallback set via `prepare_conditionals()`)
 
-## CUDA Graph Wrapper (models/t3/t3_cuda_graphs.py)
+### Tokenizer Language Preprocessing
 
-### How It Works
-
-CUDA graphs capture the exact sequence of GPU operations. For replay, input tensors are updated in-place before each replay call (`.copy_()`). This gives ~10-20% inference speedup.
-
-**Bucketing:** Token sequence length is rounded up to the nearest 250 (max 1500). One CUDA graph per bucket, shared across all calls with that bucket size.
-
-```
-get_next_bucket(seq_len, bucket_size=250) → 250 | 500 | 750 | 1000 | 1250 | 1500
-```
-
-### T3StepCUDAGraphWrapper (single generation)
-
-```python
-def __call__(speech_embedding_cache, output_logits, i_tensor, ...)
-    # If bucket not captured yet: captures graph
-    # Otherwise: copies inputs into static tensors, replays graph
-
-def _capture_graph_for_bucket(bucket_key)   # One-time capture
-def reset(bucket_key=None)                   # Clear captured graphs
-def guard()                                  # Validate dtype consistency
-```
-
-### T3BatchStepCUDAGraphWrapper (batch generation)
-
-Same as single-step but also tracks `finished_mask` for per-sequence early stopping.
-
-### Critical Constraint
-
-**CUDA graph capture must not happen concurrently with any other CUDA operation** (including model loading, other captures). A concurrent CUDA op during capture corrupts the graph, leading to `index_copy_(): index out of bounds` → `cudaErrorAssert` → process crash.
-
-AI-Server pre-captures all 6 direct-path graphs at startup via `TTSService.warmup()`. Batch-path graphs (batch_size > 1) are captured lazily at runtime — this is safe because STT streaming sessions no longer load models on GPU.
-
----
-
-## S3Gen Vocoder (models/s3gen/s3gen.py)
-
-### Pipeline
-
-```
-speech_tokens → [Flow Matching Diffusion] → mel (25Hz, 100D) → [HiFiGAN] → wav (24kHz)
-```
-
-### Key Methods
-
-```python
-# Extract reference dict from audio (for conditioning)
-embed_ref(wav: Tensor, sr: int, device) → ref_dict
-
-# End-to-end inference
-S3Token2Wav.inference(speech_tokens, ref_dict) → wav Tensor [1, T]
-
-# Batch reference collation
-collate_ref_dicts(ref_dicts: list[dict], device) → batched_ref_dict
-```
-
-### ref_dict Structure
-
-```python
-{
-    "prompt_token":     list[Tensor],   # Discrete codes of reference audio
-    "prompt_token_len": int,
-    "prompt_feat":      list[Tensor],   # Mel spectrogram of reference
-    "prompt_feat_len":  int,
-    "embedding":        Tensor          # Speaker embedding vector
-}
-```
-
----
-
-## Voice Encoder (models/voice_encoder/voice_encoder.py)
-
-LSTM-based speaker embedding extractor.
-
-```
-audio (16kHz) → 128-dim mel → sliding 80-frame windows → LSTM(256) → proj → L2-norm → 256-dim embedding
-```
-
-```python
-ve.embeds_from_wavs(wavs: list[Tensor], sr: int) → Tensor (B, 256)
-```
-
----
-
-## Tokenizer (models/tokenizers/tokenizer.py)
-
-Language-aware BPE tokenizer.
-
-```python
-tokenizer.encode(text, language_id) → list[int]
-tokenizer.text_to_tokens_batch(texts, language_id, sot_token, eot_token) → (tokens, mask)
-```
-
-**Language preprocessing:**
-- `zh` → Cangjie glyph codes
+The `MTLTokenizer` applies language-specific transforms before BPE:
+- `zh` → Cangjie glyph codes (spacy-pkuseg)
 - `ja` → Hiragana (pykakasi)
 - `he` → Diacritics (ONNX model)
 - `ko` → Jamo decomposition
 - `fr` → Accent decomposition
 - `ru` → Stress marks
 
-**Special tokens:** `[START]=255`, `[STOP]=0`, `[PAD]`, `[UNK]`
-
----
-
-## Key Parameters
-
-| Parameter | Default | Range | Effect |
-|-----------|---------|-------|--------|
-| `exaggeration` | 0.5 | 0–1 | Emotion/emphasis intensity |
-| `cfg_weight` | 0.5 | 0–1 | Reference voice fidelity |
-| `temperature` | 0.8 | >0 | Token sampling diversity |
-| `max_new_tokens` | 1000 | — | Single gen token limit |
-| `max_new_tokens` (batch) | 400 | — | Batch gen token limit |
-| `max_cache_len` | 1500 | — | KV-cache window size |
-| `min_p` | 0.05 | 0–1 | Min prob filter |
-| `top_p` | 1.0 | 0–1 | Nucleus sampling |
-| `repetition_penalty` | 1.2 | ≥1 | Penalize repeated tokens |
-
----
-
-## Supported Languages
-
-```
-ar da de el en es fi fr he hi it ja ko ms nl no pl pt ru sv sw tr zh
-```
-
----
-
 ## Thread Safety
 
-- `generate()` — **thread-safe** (no shared mutable state during inference)
-- `generate_batch()` — **NOT thread-safe** (must be called from single GPU worker)
-- `extract_voice_embedding()` — **thread-safe** (does not modify `self.conds`)
-- `prepare_conditionals()` — mutates `self.conds` — not thread-safe
+- `generate()` — **thread-safe**
+- `generate_batch()` — **NOT thread-safe** (must run from single GPU worker)
+- `extract_voice_embedding()` — **thread-safe**
+- `prepare_conditionals()` — mutates `self.conds` — **NOT thread-safe**
 
----
+## Key Constraints
 
-## Package Setup
+- **PyTorch ≥ 2.8, torchaudio ≥ 2.8** required. GPU target: CUDA 12.8 (RTX 5000). Dev: macOS Apple Silicon (MPS).
+- Model weights auto-download from `ResembleAI/chatterbox` on first `from_pretrained()` call.
+- `generate_batch()` uses `max_new_tokens=400` by default (vs 1000 for single). This is intentional for latency.
+- Output sample rate is always `model.sr = 24000`.
+- PerTh watermarking is always applied to generated audio.
+- The custom Llama implementation in `src/chatterbox/models/t3/inference/custom_llama/modeling_llama.py` is a stripped-down fork of HuggingFace transformers' Llama — do not replace it with the upstream version.
+- Supported languages: `ar da de el en es fi fr he hi it ja ko ms nl no pl pt ru sv sw tr zh`
 
-```bash
-pip install -e .          # Install in editable mode
-# or
-uv pip install -e .       # In AI-Server's uv venv
-```
+## Known TODOs in Code
 
-Requires PyTorch ≥ 2.8, torchaudio ≥ 2.8. GPU target: CUDA 12.8 (RTX 5000).
-
-Model weights auto-downloaded from `ResembleAI/chatterbox` on first `from_pretrained()` call.
+- `t3.py:235` — `torch.compile` synchronization not implemented
+- `s3tokenizer/s3tokenizer.py` — FIXME: inherits `nn.Module` but processes wavs one-by-one
+- `cond_enc.py:67` — CLAP embeddings not yet implemented
+- `alignment_stream_analyzer.py` — monotonic masking may skip spaces
