@@ -13,7 +13,7 @@ from huggingface_hub import snapshot_download
 
 from .models.t3 import T3
 from .models.t3.modules.t3_config import T3Config
-from .models.s3tokenizer import S3_SR, drop_invalid_tokens
+from .models.s3tokenizer import S3_SR, EOS, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
@@ -676,8 +676,8 @@ class ChatterboxMultilingualTTS:
                 valid_token_lens.append(len(valid_t))
             
             # Create padded batch [B, T_max]
-            # Use 0 as pad value (masked out by flow model)
-            s3_input_tokens = pad_sequence(valid_tokens_list, batch_first=True, padding_value=0).to(self.device)
+            # Use EOS (6562) as pad value — token 0 is a valid speech token and would produce audio in padded regions
+            s3_input_tokens = pad_sequence(valid_tokens_list, batch_first=True, padding_value=EOS).to(self.device)
             s3_token_lens = torch.tensor(valid_token_lens, dtype=torch.long, device=self.device)
             
             # 2. Collate reference dicts
@@ -718,7 +718,7 @@ class ChatterboxMultilingualTTS:
                 # So wav_len ~ token_len / 25 * 22050 ~ token_len * 882.
                 # This is precise.
                 
-                valid_wav_len = int(valid_token_lens[i] / 25.0 * 22050.0)
+                valid_wav_len = valid_token_lens[i] * 2 * 480  # token_mel_ratio(2) * hifigan_upsample(120 * istft_hop(4))
                 # Actually HiFiGAN upsamples exactly.
                 # Current s3gen returns padded batch.
                 

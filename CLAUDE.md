@@ -70,6 +70,17 @@ T3 uses CUDA graph capture with bucketed sequence lengths (250, 500, 750, 1000, 
 
 T3 model is compiled with `torch.compile(mode="reduce-overhead")` at load time. Note: `torch.compile` has a thread-safety TODO in `t3.py:235` — the compilation step itself is not synchronized.
 
+### Token-to-Waveform Upsample Chain
+
+The exact sample conversion from speech tokens to waveform samples:
+- **Token → Mel**: `token_mel_ratio = 2` (UpsampleConformerEncoder)
+- **Mel → Wav**: HiFiGAN upsample `[8, 5, 3]` = 120x, then ISTFT `hop_len = 4` → **480 samples/mel-frame**
+- **Token → Wav**: `2 × 480 = 960 samples/token`
+
+When calculating valid waveform length from token count: `wav_len = token_count * 2 * 480`
+
+**Do NOT use** `token_count / 25.0 * 22050` — this uses the wrong sample rate (22050 vs 24000) and yields 882 samples/token, causing ~8% audio truncation.
+
 ### Conditioning Priority
 
 When calling `generate()`, voice conditioning resolves in this order:
