@@ -115,6 +115,10 @@ The `MTLTokenizer` applies language-specific transforms before BPE:
 - The custom Llama implementation in `src/chatterbox/models/t3/inference/custom_llama/modeling_llama.py` is a stripped-down fork of HuggingFace transformers' Llama — do not replace it with the upstream version.
 - Supported languages: `ar da de el en es fi fr he hi it ja ko ms nl no pl pt ru sv sw tr zh`
 
+### Batch vs Single EOS Handling
+
+`inference_batch()` now uses a `length_guesstimate = text_tokens.shape[1] * 2` guard before checking for EOS tokens, matching `inference()` behavior. Before this threshold, EOS tokens are ignored and generation continues — this prevents premature truncation from spurious early EOS tokens, which is especially common with short sentences and non-English languages. The `finished_mask` is only updated after `length_guesstimate` iterations.
+
 ## Known TODOs in Code
 
 - `t3.py:235` — `torch.compile` synchronization not implemented

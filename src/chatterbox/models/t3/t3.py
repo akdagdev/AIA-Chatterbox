@@ -350,9 +350,9 @@ class T3(nn.Module):
         self.repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
 
     def update_processors(self, top_p, min_p, repetition_penalty, skip_when_1=False):
+        self.top_p_warper.skip_when_1 = skip_when_1
         if self.top_p_warper.top_p != top_p:
             self.top_p_warper.top_p = torch.tensor(top_p, device=self.top_p_warper.top_p.device)
-            self.top_p_warper.skip_when_1 = skip_when_1
         if self.min_p_warper.min_p != min_p:
             self.min_p_warper.min_p = torch.tensor(min_p, device=self.min_p_warper.min_p.device)
         if self.repetition_penalty_processor.penalty != repetition_penalty:
@@ -653,7 +653,7 @@ class T3(nn.Module):
         PAD_TOKEN_ID = self.hp.stop_speech_token + 1
         bos_len = 1
 
-        self.update_processors(top_p, min_p, repetition_penalty, skip_when_1=False)
+        self.update_processors(top_p, min_p, repetition_penalty, skip_when_1=True)
 
         inputs_embeds = inputs_embeds.to(self.patched_model.dtype)
         stop_token_tensor = torch.tensor(self.hp.stop_speech_token, device=device)
@@ -691,6 +691,9 @@ class T3(nn.Module):
             cache_position=cache_position,
         )
         output_logits = output_logits[:, -1:, :].clone()
+
+        # Minimum generation length before EOS is respected (matches single mode behavior)
+        length_guesstimate = text_tokens.shape[1] * 2
 
         # EOS tracking per batch item
         finished_mask = torch.zeros(input_batch_size, dtype=torch.bool, device=device)
@@ -757,13 +760,16 @@ class T3(nn.Module):
             )
             output_logits = output_logits.clone()
 
-            # Check for EOS per batch item
-            new_eos = (next_token.squeeze(-1) == stop_token_tensor)
-            finished_mask = finished_mask | new_eos
+            # Check for EOS per batch item only after minimum generation length
+            # Before length_guesstimate, ignore EOS tokens (matches single mode behavior)
+            # This prevents premature truncation from spurious early EOS tokens
+            if i > length_guesstimate:
+                new_eos = (next_token.squeeze(-1) == stop_token_tensor)
+                finished_mask = finished_mask | new_eos
 
-            # Early exit if all items finished
-            if finished_mask.all():
-                break
+                # Early exit if all items finished
+                if finished_mask.all():
+                    break
 
         return generated_ids
 
