@@ -764,9 +764,6 @@ class T3(nn.Module):
             i_tensor = indices[i]
             cache_pos = torch.tensor([seq_len + i], device=device)
 
-            # Per-item EOS suppression: suppress only for items still within their guesstimate
-            suppress_eos_mask = (i <= per_item_guesstimate)  # [input_batch_size]
-
             next_token, output_logits = generate_token_batch(
                 self._speech_embedding_cache,
                 output_logits,
@@ -787,7 +784,6 @@ class T3(nn.Module):
                 stop_token_tensor=pre_stop_token_tensor,
                 attention_mask=attn_mask,
                 cache_position=cache_pos,
-                suppress_eos_mask=suppress_eos_mask if suppress_eos_mask.any() else None,
             )
             output_logits = output_logits.clone()
 
@@ -972,7 +968,6 @@ def generate_t3_token_batch(
     max_position: Optional[int] = None,
     attention_mask: Optional[Tensor] = None,
     cache_position: Optional[Tensor] = None,
-    suppress_eos_mask: Optional[Tensor] = None,
 ):
     """
     Batch-aware token generation for multiple inputs simultaneously.
@@ -982,7 +977,6 @@ def generate_t3_token_batch(
         finished_mask: Boolean tensor tracking which batch items have generated EOS
         stop_token_tensor: Pre-allocated tensor for stop token (required for CUDA graphs)
         attention_mask: Optional 2D mask (eff_batch, max_cache_len) for batch padding
-        suppress_eos_mask: Optional bool tensor [input_batch_size] — True = suppress EOS for that item
     """
     # logits shape: (effective_batch_size, 1, vocab_size) -> (effective_batch_size, vocab_size)
     logits = output_logits[:, -1, :]
@@ -1000,11 +994,6 @@ def generate_t3_token_batch(
 
     if temperature != 1.0:
         logits = logits / temperature
-
-    # Suppress EOS per-item during early generation to prevent spurious EOS sampling.
-    # Only items still within their length_guesstimate have EOS suppressed.
-    if suppress_eos_mask is not None and stop_token_id is not None:
-        logits[suppress_eos_mask, stop_token_id] = float('-inf')
 
     logits = min_p_warper(None, logits)
     logits = top_p_warper(None, logits)
