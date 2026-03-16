@@ -379,16 +379,13 @@ class T3BatchStepCUDAGraphWrapper:
             generated_ids.copy_(static_tensors["generated_ids"])
         else:
             static_tensors = self._bucket_static_tensors[bucket_key]
-            static_tensors["speech_embedding_cache"].copy_(speech_embedding_cache)
+            # Only copy tensors that change between iterations.
+            # speech_embedding_cache, speech_pos_embedding_cache, batch_idx, cfg_weight,
+            # temperature are constant across all steps — captured once, never re-copied.
             static_tensors["output_logits"].copy_(output_logits)
             static_tensors["i_tensor"].copy_(i_tensor)
-            static_tensors["batch_idx"].copy_(batch_idx)
-            static_tensors["speech_pos_embedding_cache"].copy_(speech_pos_embedding_cache)
             static_tensors["generated_ids"].copy_(generated_ids)
             static_tensors["finished_mask"].copy_(finished_mask)
-            static_tensors["cfg_weight"] = cfg_weight
-            static_tensors["temperature"] = temperature
-            static_tensors["max_position"] = max_position
             if static_tensors["attention_mask"] is not None and attention_mask is not None:
                 static_tensors["attention_mask"].copy_(attention_mask)
             if static_tensors["cache_position"] is not None and cache_position is not None:

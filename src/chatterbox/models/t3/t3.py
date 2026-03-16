@@ -679,6 +679,12 @@ class T3(nn.Module):
             max_text_len = text_tokens.shape[1]
         max_new_tokens = min(max_new_tokens, max(max_text_len * 4, 100))
 
+        # Compute the smallest bucket that covers the full generation range.
+        # Single mode adapts max_position per bucket; batch mode was always using
+        # TOKEN_LIMIT=1500. KV cache reads scale linearly with max_position, so
+        # a 500-bucket is 3× faster than 1500 for typical short-to-medium texts.
+        gen_max_position = get_next_bucket(seq_len + max_new_tokens)
+
         # Create generated_ids for all batch items
         generated_ids = torch.full(
             (input_batch_size, bos_len + TOKEN_LIMIT), 
@@ -732,9 +738,11 @@ class T3(nn.Module):
         if attn_mask is not None:
             model_dtype = self.patched_model.dtype
             min_dtype = torch.finfo(model_dtype).min
-            # Shape: (effective_batch_size, 1, 1, max_cache_len)
+            # Width = gen_max_position, not max_cache_len — the attention layer clips
+            # K/V to max_position, so entries beyond gen_max_position are never read.
+            # Smaller mask → less data to copy into the CUDA graph static tensor each step.
             gen_attn_mask = torch.full(
-                (effective_batch_size, 1, 1, max_cache_len),
+                (effective_batch_size, 1, 1, gen_max_position),
                 min_dtype, dtype=model_dtype, device=device,
             )
             # Unmask initial context positions (0..seq_len-1) where not padding.
@@ -814,6 +822,7 @@ class T3(nn.Module):
                 finished_mask,
                 stop_token_id=self.hp.stop_speech_token,
                 stop_token_tensor=pre_stop_token_tensor,
+                max_position=gen_max_position,
                 attention_mask=gen_attn_mask,
                 cache_position=cache_pos,
             )
