@@ -199,8 +199,9 @@ class ChatterboxMultilingualTTS:
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
         
-        # Optimize T3
-        t3 = torch.compile(t3, mode="reduce-overhead")
+        # Note: torch.compile on the module only wraps forward() (training path).
+        # Inference uses inference()/inference_batch() which bypass compiled forward.
+        # Single-mode compilation is handled by standalone _generate_token_variants.
 
         # Load checkpoint once
         s3gen_state = torch.load(ckpt_dir / "s3gen.pt", map_location=device, weights_only=True)

@@ -310,17 +310,13 @@ class T3(nn.Module):
         return self._direct_cache
 
     def get_cache_batch(self, config, max_batch_size, max_cache_len, device, dtype):
-        """Cache for inference_batch() — single slot, recreated when batch size changes.
-        CUDA_CAPTURE_LOCK in t3_cuda_graphs prevents capture/STT conflicts during
-        the brief first-time graph captures that follow a cache recreation."""
+        """Always create a fresh cache for batch inference.
+        Eliminates stale state from StaticCache's get_seq_length() heuristic
+        (counts non-zero key positions, fragile with zero-embedding batches)."""
         if hasattr(self, '_batch_cache'):
-            if self._params_match(self._batch_cache_params, max_batch_size, max_cache_len, device, dtype):
-                self._batch_cache.reset()
-                return self._batch_cache
             del self._batch_cache
-            # Batch cache params changed — invalidate batch wrapper only.
-            if hasattr(self, 'batch_cudagraph_wrapper'):
-                del self.batch_cudagraph_wrapper
+        if hasattr(self, 'batch_cudagraph_wrapper'):
+            del self.batch_cudagraph_wrapper
         self._batch_cache, self._batch_cache_params = self._make_cache(
             config, max_batch_size, max_cache_len, device, dtype)
         return self._batch_cache
@@ -596,6 +592,7 @@ class T3(nn.Module):
         return generated_ids
 
     @torch.inference_mode()
+    @torch.compiler.disable
     def inference_batch(
         self,
         *,
