@@ -78,6 +78,7 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         output_attentions=False,
         cache_position=None,
         max_position=None,
+        attention_mask=None,
     ):
         """
         This is a method used by huggingface's generate() method.
@@ -85,11 +86,13 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
 
         :param inputs_embeds: (B, S, C) float32 tensor of conditioning inputs. If past key values are given,
         S should be 1.
+        :param attention_mask: Optional (B, max_cache_len) mask for batch padding. None = default causal mask.
         """
         # Handle input validation before calling the model
 
         tfmr_out = self.model(
             inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,

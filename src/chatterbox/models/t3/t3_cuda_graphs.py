@@ -245,6 +245,7 @@ class T3BatchStepCUDAGraphWrapper:
         input_batch_size: int,
         stop_token_id: int,
         stop_token_tensor: torch.Tensor,  # Pre-allocated tensor
+        attention_mask: torch.Tensor = None,  # Batch text padding mask
     ):
         self.generate_token_batch = generate_token_batch
         self.patched_model = patched_model
@@ -255,6 +256,7 @@ class T3BatchStepCUDAGraphWrapper:
         self.input_batch_size = input_batch_size
         self.stop_token_id = stop_token_id
         self.stop_token_tensor = stop_token_tensor
+        self.attention_mask = attention_mask
 
         self._bucket_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._bucket_static_tensors: Dict[int, dict] = {}
@@ -297,6 +299,10 @@ class T3BatchStepCUDAGraphWrapper:
             static_tensors["temperature"] = temperature
             static_tensors["finished_mask"] = finished_mask.clone()
             static_tensors["max_position"] = bucket_key
+            if self.attention_mask is not None:
+                static_tensors["attention_mask"] = self.attention_mask.clone()
+            else:
+                static_tensors["attention_mask"] = None
 
             with torch.inference_mode():
                 with torch.cuda.graph(self._bucket_graphs[bucket_key]):
@@ -317,8 +323,9 @@ class T3BatchStepCUDAGraphWrapper:
                         self.input_batch_size,
                         static_tensors["finished_mask"],
                         self.stop_token_id,
-                        self.stop_token_tensor,  # Use pre-allocated tensor
+                        self.stop_token_tensor,
                         static_tensors["max_position"],
+                        static_tensors["attention_mask"],
                     )
 
             self._bucket_static_tensors[bucket_key] = static_tensors
@@ -347,6 +354,7 @@ class T3BatchStepCUDAGraphWrapper:
         stop_token_id: int = None,
         stop_token_tensor: torch.Tensor = None,
         max_position: Optional[int] = None,
+        attention_mask: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bucket_key = max_position or TOKEN_LIMIT
 
@@ -376,12 +384,14 @@ class T3BatchStepCUDAGraphWrapper:
             static_tensors["speech_pos_embedding_cache"].copy_(speech_pos_embedding_cache)
             static_tensors["generated_ids"].copy_(generated_ids)
             static_tensors["finished_mask"].copy_(finished_mask)
+            if self.attention_mask is not None and static_tensors["attention_mask"] is not None:
+                static_tensors["attention_mask"].copy_(self.attention_mask)
             static_tensors["cfg_weight"] = cfg_weight
             static_tensors["temperature"] = temperature
             static_tensors["max_position"] = max_position
 
             self._bucket_graphs[bucket_key].replay()
-            
+
             # Copy static generated_ids back to original after replay
             generated_ids.copy_(static_tensors["generated_ids"])
 

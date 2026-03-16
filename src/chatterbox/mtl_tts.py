@@ -654,6 +654,12 @@ class ChatterboxMultilingualTTS:
                 top_p=top_p,
             )
             
+            # Replace PAD tokens with EOS — safety net for items that didn't generate EOS.
+            # Without this, PAD (6563) passes through drop_invalid_tokens → 60s garbage audio.
+            PAD_TOKEN_ID = self.t3.hp.stop_speech_token + 1  # 6563
+            speech_tokens = speech_tokens.clone()
+            speech_tokens[speech_tokens == PAD_TOKEN_ID] = EOS
+
             # S3Gen: Per-item sequential inference using FP16 copies
             # Tensor batching causes OOM due to O(T²) attention in UpsampleConformerEncoder.
             # Per-item reduces attention memory from B×8×T²×4B (~655 MiB) to 1×8×T²×2B (~41 MiB).
