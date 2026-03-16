@@ -664,11 +664,18 @@ class T3(nn.Module):
         self.update_processors(top_p, min_p, repetition_penalty, skip_when_1=True)
 
         inputs_embeds = inputs_embeds.to(self.patched_model.dtype)
-        stop_token_tensor = torch.tensor(self.hp.stop_speech_token, device=device)
 
         _, seq_len = inputs_embeds.shape[:2]
         if max_cache_len < seq_len + max_new_tokens:
             max_new_tokens = max_cache_len - seq_len
+
+        # Dynamic cap: natural EOS occurs at ~1.3x text tokens. 4x provides
+        # generous margin while preventing full 400-step loops for short texts.
+        if text_attention_mask is not None:
+            max_text_len = int(text_attention_mask[:input_batch_size].sum(dim=1).max().item())
+        else:
+            max_text_len = text_tokens.shape[1]
+        max_new_tokens = min(max_new_tokens, max(max_text_len * 4, 100))
 
         # Create generated_ids for all batch items
         generated_ids = torch.full(
@@ -714,14 +721,6 @@ class T3(nn.Module):
             attention_mask=attn_mask,
         )
         output_logits = output_logits[:, -1:, :].clone()
-
-        # Per-item minimum generation length before EOS is respected.
-        # Uses actual text lengths (not padded max) so short items can stop early.
-        if text_attention_mask is not None:
-            text_lengths = text_attention_mask[:input_batch_size].sum(dim=1)  # [input_batch_size]
-        else:
-            text_lengths = torch.full((input_batch_size,), text_tokens.shape[1], device=device)
-        per_item_guesstimate = (text_lengths * 2).long()  # [input_batch_size]
 
         # EOS tracking per batch item
         finished_mask = torch.zeros(input_batch_size, dtype=torch.bool, device=device)
@@ -787,15 +786,13 @@ class T3(nn.Module):
             )
             output_logits = output_logits.clone()
 
-            # Per-item EOS check: only check items past their individual guesstimate
-            past_guesstimate = (i > per_item_guesstimate)  # [input_batch_size]
-            if past_guesstimate.any():
-                has_eos = (generated_ids == stop_token_tensor).any(dim=1)  # [input_batch_size]
-                newly_finished = past_guesstimate & has_eos
-                finished_mask = finished_mask | newly_finished
-
-                if finished_mask.all():
-                    break
+            # Immediate EOS detection via latest token.
+            # drop_invalid_tokens truncates at first EOS regardless — delaying
+            # detection only wastes loop iterations without affecting audio quality.
+            newly_eos = (next_token.squeeze(1) == self.hp.stop_speech_token)
+            finished_mask = finished_mask | newly_eos
+            if finished_mask.all():
+                break
 
         return generated_ids
 

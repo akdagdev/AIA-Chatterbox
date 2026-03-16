@@ -111,7 +111,7 @@ The `MTLTokenizer` applies language-specific transforms before BPE:
 
 - **PyTorch ≥ 2.8, torchaudio ≥ 2.8** required. GPU target: CUDA 12.8 (RTX 5000). Dev: macOS Apple Silicon (MPS).
 - Model weights auto-download from `ResembleAI/chatterbox` on first `from_pretrained()` call.
-- `generate_batch()` uses `max_new_tokens=400` by default (vs 1000 for single). This is intentional for latency.
+- `generate_batch()` default `max_new_tokens=1000`, but AI-Server passes 400 for latency. A dynamic cap of 4× the longest text's token count further limits iterations.
 - Output sample rate is always `model.sr = 24000`.
 - PerTh watermarking is always applied to generated audio.
 - The custom Llama implementation in `src/chatterbox/models/t3/inference/custom_llama/modeling_llama.py` is a stripped-down fork of HuggingFace transformers' Llama — do not replace it with the upstream version.
@@ -135,7 +135,7 @@ Additionally, a **symmetric attention mask** is passed to Llama's forward call: 
 
 ### Batch vs Single EOS Handling
 
-`inference_batch()` uses a `length_guesstimate = text_tokens.shape[1] * 2` guard before checking for EOS tokens, matching `inference()` behavior. Before this threshold, EOS tokens are ignored and generation continues — this prevents premature truncation from spurious early EOS tokens, which is especially common with short sentences and non-English languages. After `length_guesstimate`, EOS scanning checks all `generated_ids` per item (not just the latest token), matching single mode's `(generated_ids == stop_token_tensor).any()` behavior.
+`inference_batch()` checks every generated token for EOS immediately — no guesstimate guard. When an item generates EOS, it is marked finished and all subsequent tokens are force-set to EOS. `drop_invalid_tokens` truncates at the first EOS regardless, so delaying detection only wastes loop iterations without affecting audio quality. A dynamic `max_new_tokens` cap (4× longest text tokens, minimum 100) prevents runaway loops. The loop exits as soon as all batch items have generated at least one EOS token.
 
 ## Known TODOs in Code
 
