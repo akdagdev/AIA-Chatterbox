@@ -760,33 +760,11 @@ class T3(nn.Module):
         # Pre-allocate stop_token_tensor for CUDA graph compatibility
         pre_stop_token_tensor = torch.tensor([[self.hp.stop_speech_token]], device=device, dtype=torch.long)
 
-        # Select generation backend: CUDA graphs when on GPU, eager otherwise.
-        # The 4D attention mask is static within each inference_batch() call and is
-        # captured as a CUDA graph static tensor alongside cache_position.
-        is_cuda = device.type == "cuda"
-
-        if is_cuda:
-            # Use CUDA Graphs for optimized generation.
-            # CUDA_CAPTURE_LOCK in t3_cuda_graphs prevents capture/STT conflicts.
-            if not hasattr(self, "batch_cudagraph_wrapper") or \
-               self.batch_cudagraph_wrapper.input_batch_size != input_batch_size or \
-               self.batch_cudagraph_wrapper.kv_cache is not kv_cache:
-                from .t3_cuda_graphs import T3BatchStepCUDAGraphWrapper
-                self.batch_cudagraph_wrapper = T3BatchStepCUDAGraphWrapper(
-                    generate_t3_token_batch,
-                    self.patched_model,
-                    kv_cache,
-                    self.repetition_penalty_processor,
-                    self.min_p_warper,
-                    self.top_p_warper,
-                    input_batch_size,
-                    self.hp.stop_speech_token,
-                    pre_stop_token_tensor,
-                )
-            self.batch_cudagraph_wrapper.guard()
-            generate_token_batch = self.batch_cudagraph_wrapper
-        else:
-            generate_token_batch = generate_t3_token_batch
+        # Batch always uses eager — CUDA graph capture produces unreliable output
+        # (first call returns silence for all items regardless of mask format).
+        # gen_max_position clips KV cache reads to actual generation range (up to 3×
+        # speedup vs the full 1500-bucket default: e.g., bucket 500 vs 1500).
+        generate_token_batch = generate_t3_token_batch
 
         # Pre-allocate cache_position tensor — updated in-place each iteration
         cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
@@ -799,12 +777,7 @@ class T3(nn.Module):
             if gen_attn_mask is not None:
                 gen_attn_mask[:, 0, 0, seq_len + i] = 0.0
 
-            # First step runs eagerly — CUDA graph capture-time execution produces
-            # unreliable output (0 valid tokens). The graph is captured on step 1
-            # instead; subsequent steps replay at full speed (~130 it/s).
-            step_fn = generate_t3_token_batch if (i == 0 and is_cuda) else generate_token_batch
-
-            next_token, output_logits = step_fn(
+            next_token, output_logits = generate_token_batch(
                 self._speech_embedding_cache,
                 output_logits,
                 i_tensor,

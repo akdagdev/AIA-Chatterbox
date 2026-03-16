@@ -131,13 +131,13 @@ Additionally, a **symmetric attention mask** is passed to Llama's forward call: 
 
 **Do NOT** replace PAD tokens with EOT — this creates `[SOT, t1, t2, EOT, EOT, EOT]` sequences that destabilize T3's attention patterns and cause stuttering/hallucinations.
 
-**Batch uses CUDA graphs with pre-computed 4D attention mask** — the 2D attention mask is used for the initial forward pass (prefill), then converted to a 4D mask `(batch, 1, 1, gen_max_position)` for the generation loop. `gen_max_position = get_next_bucket(seq_len + max_new_tokens)` — the smallest bucket that covers the full generation range. KV cache reads scale linearly with max_position, so using 500 instead of 1500 gives ~3× fewer reads for typical texts. Passing a 4D mask causes `_prepare_4d_causal_attention_mask_with_cache_position` to return it directly, bypassing `torch.full`/`torch.arange`/`clone`/`masked_fill` intermediate allocations that corrupt CUDA graph capture. The 4D mask is updated per-step (unmask one new position) and copied to the graph's static tensor. The batch KV cache is reused across calls (reset, not recreated) to preserve graph captures. Falls back to eager on non-CUDA devices (MPS).
+**Batch uses eager mode (no CUDA graphs)** — CUDA graph capture for batch mode produces corrupted output (first call with each new batch size returns 0 valid speech tokens for all items), regardless of mask format (2D or 4D). Eager mode runs at ~66-80 it/s vs ~130 it/s with graphs, but is still faster than sequential single-item processing.
 
-**Step 0 always runs eagerly** — CUDA graph capture-time execution produces unreliable output (0 valid speech tokens for all items). The graph is captured on step 1 and replayed from step 2 onwards at ~130 it/s. The cost is one eager step (~10ms), negligible across 100-300 step loops.
+**gen_max_position optimization** — the generation loop uses `gen_max_position = get_next_bucket(seq_len + max_new_tokens)` (the smallest bucket covering the actual generation range) instead of the full cache size. KV cache reads scale linearly with max_position, so using bucket 500 instead of 1500 gives ~3× fewer reads for typical short texts, yielding meaningful speedup within eager mode.
 
-**Do NOT** pass a 2D attention mask to the CUDA-graphed generation loop — the custom Llama's `_update_causal_mask` creates ~10 intermediate tensor allocations from the 2D→4D conversion, which produce corrupted output when captured in a CUDA graph.
+**4D attention mask in generation loop** — the 2D attention mask is used for the initial forward pass (prefill), then converted to a 4D mask `(batch, 1, 1, gen_max_position)` for the generation loop. Updated per-step by unmasking one new position. This is necessary for correctness (not for CUDA graph compatibility) — passing a 2D mask during generation would re-trigger `_prepare_4d_causal_attention_mask_with_cache_position` each step with dynamic shape allocations.
 
-**Do NOT** use the output of the CUDA graph capture step — capture-time execution always produces 0 valid tokens. This is a known PyTorch behavior with complex models; workaround is to run step 0 eagerly.
+**Do NOT** attempt to re-enable CUDA graphs for batch mode — capture-time execution consistently produces 0 valid tokens across multiple capture strategies (pre-warmup, step-0-eager, 4D masks). The root cause is that complex batch state (finished_mask, force-EOS logic, CFG duplication) makes capture-time execution unreliable in ways that differ from single-mode.
 
 ### Batch vs Single EOS Handling
 
