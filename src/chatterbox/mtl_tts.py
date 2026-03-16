@@ -622,19 +622,12 @@ class ChatterboxMultilingualTTS:
             eot_token=eot
         )
         text_tokens = text_tokens.to(self.device)
-        
-        # Replace PAD tokens with EOT to prevent model confusion
-        # PAD token is typically 0 or vocab["[PAD]"]
-        pad_token_id = 0  # Default PAD token
-        text_tokens = torch.where(
-            attention_mask.to(self.device) == 0,
-            torch.tensor(eot, device=self.device),
-            text_tokens
-        )
+        attention_mask = attention_mask.to(self.device)
 
-        # CFG: duplicate tokens and T3Cond only when CFG is enabled
+        # CFG: duplicate tokens, attention_mask, and T3Cond only when CFG is enabled
         if cfg_weight > 0:
             text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+            attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
             
             # Only duplicate conds if we are NOT relying on broadcasting
             # If cond size is 1 and batch > 1, we leave it as 1 to broadcast to (2*batch) inside T3
@@ -651,6 +644,7 @@ class ChatterboxMultilingualTTS:
             speech_tokens = self.t3.inference_batch(
                 t3_cond=t3_cond_to_use,
                 text_tokens=text_tokens,
+                text_attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 cfg_weight=cfg_weight,

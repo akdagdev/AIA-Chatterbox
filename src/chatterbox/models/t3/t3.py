@@ -109,6 +109,7 @@ class T3(nn.Module):
         text_tokens: torch.LongTensor,
         speech_tokens: torch.LongTensor,
         cfg_weight: float = 0.0,
+        text_attention_mask: Optional[Tensor] = None,
     ):
         if self.dtype != t3_cond.speaker_emb.dtype:
             t3_cond.to(dtype=self.dtype)
@@ -126,6 +127,14 @@ class T3(nn.Module):
         if self.hp.input_pos_emb == "learned":
             text_emb = text_emb + self.text_pos_emb(text_tokens)
             speech_emb = speech_emb + self.speech_pos_emb(speech_tokens)
+
+        # Zero out padded text positions so the model never sees PAD content.
+        # With bias=False (Llama), zero embeddings produce zero K/V vectors,
+        # contributing nothing to attention output.
+        if text_attention_mask is not None:
+            mask_3d = text_attention_mask.unsqueeze(-1).to(text_emb.dtype)  # (B, L, 1)
+            text_emb = text_emb * mask_3d
+
         len_cond = cond_emb.size(1)
 
         if cond_emb.size(0) != text_emb.size(0):
@@ -592,6 +601,7 @@ class T3(nn.Module):
         *,
         t3_cond: T3Cond,
         text_tokens: Tensor,
+        text_attention_mask: Optional[Tensor] = None,
         initial_speech_tokens: Optional[Tensor] = None,
         max_new_tokens=1000,
         temperature=0.8,
@@ -633,6 +643,7 @@ class T3(nn.Module):
             text_tokens=text_tokens,
             speech_tokens=initial_speech_tokens,
             cfg_weight=cfg_weight,
+            text_attention_mask=text_attention_mask,
         )
 
         self.init_patched_model(len_cond=len_cond, text_tokens_size=text_tokens.size(-1))
@@ -764,8 +775,11 @@ class T3(nn.Module):
             # Before length_guesstimate, ignore EOS tokens (matches single mode behavior)
             # This prevents premature truncation from spurious early EOS tokens
             if i > length_guesstimate:
-                new_eos = (next_token.squeeze(-1) == stop_token_tensor)
-                finished_mask = finished_mask | new_eos
+                # Scan all generated_ids for EOS — matches single mode behavior
+                # Single mode: (generated_ids == stop_token_tensor).any()
+                # Batch mode: per-item check across all generated positions
+                has_eos = (generated_ids == stop_token_tensor).any(dim=1)  # [input_batch_size]
+                finished_mask = finished_mask | has_eos
 
                 # Early exit if all items finished
                 if finished_mask.all():

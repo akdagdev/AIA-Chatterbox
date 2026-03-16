@@ -115,9 +115,17 @@ The `MTLTokenizer` applies language-specific transforms before BPE:
 - The custom Llama implementation in `src/chatterbox/models/t3/inference/custom_llama/modeling_llama.py` is a stripped-down fork of HuggingFace transformers' Llama — do not replace it with the upstream version.
 - Supported languages: `ar da de el en es fi fr he hi it ja ko ms nl no pl pt ru sv sw tr zh`
 
+### Batch Text Padding — Zero-Masking (not PAD→EOT)
+
+When batch items have different text lengths, the tokenizer pads shorter items. Instead of replacing PAD tokens with EOT (which creates multiple EOT tokens the model never saw during training), `generate_batch()` passes the `text_attention_mask` through to `T3.prepare_input_embeds()`, which zeros out padded positions' embeddings (content + positional) after all other processing.
+
+**Why this works:** Llama uses `bias=False` throughout (attention projections, MLP). Zero embeddings produce zero K/V vectors: `K[pad] = W_k @ 0 = 0`, `V[pad] = W_v @ 0 = 0`. Regardless of attention weights, `weight * 0 = 0` — padded positions contribute nothing to the output. The model effectively "doesn't see" them.
+
+**Do NOT** replace PAD tokens with EOT — this creates `[SOT, t1, t2, EOT, EOT, EOT]` sequences that destabilize T3's attention patterns and cause stuttering/hallucinations.
+
 ### Batch vs Single EOS Handling
 
-`inference_batch()` now uses a `length_guesstimate = text_tokens.shape[1] * 2` guard before checking for EOS tokens, matching `inference()` behavior. Before this threshold, EOS tokens are ignored and generation continues — this prevents premature truncation from spurious early EOS tokens, which is especially common with short sentences and non-English languages. The `finished_mask` is only updated after `length_guesstimate` iterations.
+`inference_batch()` uses a `length_guesstimate = text_tokens.shape[1] * 2` guard before checking for EOS tokens, matching `inference()` behavior. Before this threshold, EOS tokens are ignored and generation continues — this prevents premature truncation from spurious early EOS tokens, which is especially common with short sentences and non-English languages. After `length_guesstimate`, EOS scanning checks all `generated_ids` per item (not just the latest token), matching single mode's `(generated_ids == stop_token_tensor).any()` behavior.
 
 ## Known TODOs in Code
 
