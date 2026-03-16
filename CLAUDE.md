@@ -123,9 +123,15 @@ When batch items have different text lengths, the tokenizer pads shorter items. 
 
 **Why this works:** Llama uses `bias=False` throughout (attention projections, MLP). Zero embeddings produce zero K/V vectors: `K[pad] = W_k @ 0 = 0`, `V[pad] = W_v @ 0 = 0`. Regardless of attention weights, `weight * 0 = 0` — padded positions contribute nothing to the output. The model effectively "doesn't see" them.
 
-**Do NOT** pass an `attention_mask` to Llama's forward call for batch mode — it changes the softmax distribution compared to single mode (which never uses one). The model was trained without attention masking, so adding one causes corrupted audio. Embedding zeroing alone is sufficient.
+Additionally, a **symmetric attention mask** is passed to Llama's forward call: the **same** mask is used for both conditioned and unconditioned CFG halves. This makes padded positions invisible in attention (not just in value), so BOS immediately "follows" real text from the model's perspective — matching per-item single-mode behavior. The mask is the tokenizer's original `text_attention_mask` duplicated for CFG; no special unconditioned mask is constructed.
+
+**Do NOT** use an asymmetric attention mask (e.g., `zeros_like` or `ones_like` for the unconditioned half) — this breaks CFG by making the conditioned and unconditioned halves see different effective sequence structures.
+
+**Do NOT** omit the attention mask entirely — without it, the zero-embedding gap between real text end and BOS confuses the model, causing it to never generate EOS (max-length random output).
 
 **Do NOT** replace PAD tokens with EOT — this creates `[SOT, t1, t2, EOT, EOT, EOT]` sequences that destabilize T3's attention patterns and cause stuttering/hallucinations.
+
+**Batch uses eager mode (no CUDA graphs)** — CUDA graph capture with batch attention masks produces corrupted output (first batch with each new size returns 0 valid tokens). Eager mode runs at ~50-80 it/s vs ~130 it/s with graphs. Batch is still faster than sequential single-item processing.
 
 ### Batch vs Single EOS Handling
 
