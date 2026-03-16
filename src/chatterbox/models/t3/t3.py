@@ -791,7 +791,12 @@ class T3(nn.Module):
             if gen_attn_mask is not None:
                 gen_attn_mask[:, 0, 0, seq_len + i] = 0.0
 
-            next_token, output_logits = generate_token_batch(
+            # First step runs eagerly — CUDA graph capture-time execution produces
+            # unreliable output (0 valid tokens). The graph is captured on step 1
+            # instead; subsequent steps replay at full speed (~130 it/s).
+            step_fn = generate_t3_token_batch if (i == 0 and is_cuda) else generate_token_batch
+
+            next_token, output_logits = step_fn(
                 self._speech_embedding_cache,
                 output_logits,
                 i_tensor,

@@ -133,7 +133,11 @@ Additionally, a **symmetric attention mask** is passed to Llama's forward call: 
 
 **Batch uses CUDA graphs with pre-computed 4D attention mask** — the 2D attention mask is used for the initial forward pass (prefill), then converted to a 4D mask `(batch, 1, 1, max_cache_len)` for the generation loop. Passing a 4D mask causes `_prepare_4d_causal_attention_mask_with_cache_position` to return it directly, bypassing `torch.full`/`torch.arange`/`clone`/`masked_fill` intermediate allocations that corrupt CUDA graph capture. The 4D mask is updated per-step (unmask one new position) and copied to the graph's static tensor. The batch KV cache is reused across calls (reset, not recreated) to preserve graph captures. Falls back to eager on non-CUDA devices (MPS).
 
-**Do NOT** pass a 2D attention mask to the CUDA-graphed generation loop — the custom Llama's `_update_causal_mask` creates ~10 intermediate tensor allocations from the 2D→4D conversion, which produce corrupted output when captured in a CUDA graph (all items generate 0 valid speech tokens).
+**Step 0 always runs eagerly** — CUDA graph capture-time execution produces unreliable output (0 valid speech tokens for all items). The graph is captured on step 1 and replayed from step 2 onwards at ~130 it/s. The cost is one eager step (~10ms), negligible across 100-300 step loops.
+
+**Do NOT** pass a 2D attention mask to the CUDA-graphed generation loop — the custom Llama's `_update_causal_mask` creates ~10 intermediate tensor allocations from the 2D→4D conversion, which produce corrupted output when captured in a CUDA graph.
+
+**Do NOT** use the output of the CUDA graph capture step — capture-time execution always produces 0 valid tokens. This is a known PyTorch behavior with complex models; workaround is to run step 0 eagerly.
 
 ### Batch vs Single EOS Handling
 
