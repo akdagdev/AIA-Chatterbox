@@ -13,7 +13,7 @@ from huggingface_hub import snapshot_download
 
 from .models.t3 import T3
 from .models.t3.modules.t3_config import T3Config
-from .models.s3tokenizer import S3_SR, EOS, drop_invalid_tokens
+from .models.s3tokenizer import S3_SR, EOS, SPEECH_VOCAB_SIZE, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
@@ -676,6 +676,7 @@ class ChatterboxMultilingualTTS:
             results = []
             for i in range(batch_size):
                 valid_tokens = drop_invalid_tokens(speech_tokens[i]).to(self.device)
+                valid_tokens = valid_tokens[valid_tokens < SPEECH_VOCAB_SIZE]
 
                 if len(valid_tokens) < MIN_SPEECH_TOKENS:
                     # Too few tokens for S3Gen — return silence
