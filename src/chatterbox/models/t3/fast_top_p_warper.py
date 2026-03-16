@@ -12,7 +12,7 @@ class FastTopPLogitsWarper(TopPLogitsWarper):
     def __call__(
         self, input_ids: torch.LongTensor, scores: torch.FloatTensor
     ) -> torch.FloatTensor:
-        if self.skip_when_1 and self.top_p == 1.0:
+        if self.skip_when_1:
             return scores
 
         sorted_logits, sorted_indices = torch.sort(scores, descending=False)
