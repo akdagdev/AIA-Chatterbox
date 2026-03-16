@@ -349,7 +349,7 @@ class T3BatchStepCUDAGraphWrapper:
         max_position: Optional[int] = None,
         attention_mask: Optional[torch.Tensor] = None,
         cache_position: Optional[torch.Tensor] = None,
-        suppress_eos_token_id: Optional[int] = None,
+        suppress_eos_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bucket_key = max_position or TOKEN_LIMIT
 

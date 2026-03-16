@@ -715,8 +715,13 @@ class T3(nn.Module):
         )
         output_logits = output_logits[:, -1:, :].clone()
 
-        # Minimum generation length before EOS is respected (matches single mode behavior)
-        length_guesstimate = text_tokens.shape[1] * 2
+        # Per-item minimum generation length before EOS is respected.
+        # Uses actual text lengths (not padded max) so short items can stop early.
+        if text_attention_mask is not None:
+            text_lengths = text_attention_mask[:input_batch_size].sum(dim=1)  # [input_batch_size]
+        else:
+            text_lengths = torch.full((input_batch_size,), text_tokens.shape[1], device=device)
+        per_item_guesstimate = (text_lengths * 2).long()  # [input_batch_size]
 
         # EOS tracking per batch item
         finished_mask = torch.zeros(input_batch_size, dtype=torch.bool, device=device)
@@ -759,6 +764,9 @@ class T3(nn.Module):
             i_tensor = indices[i]
             cache_pos = torch.tensor([seq_len + i], device=device)
 
+            # Per-item EOS suppression: suppress only for items still within their guesstimate
+            suppress_eos_mask = (i <= per_item_guesstimate)  # [input_batch_size]
+
             next_token, output_logits = generate_token_batch(
                 self._speech_embedding_cache,
                 output_logits,
@@ -779,21 +787,17 @@ class T3(nn.Module):
                 stop_token_tensor=pre_stop_token_tensor,
                 attention_mask=attn_mask,
                 cache_position=cache_pos,
-                suppress_eos_token_id=self.hp.stop_speech_token if i <= length_guesstimate else None,
+                suppress_eos_mask=suppress_eos_mask if suppress_eos_mask.any() else None,
             )
             output_logits = output_logits.clone()
 
-            # Check for EOS per batch item only after minimum generation length
-            # Before length_guesstimate, ignore EOS tokens (matches single mode behavior)
-            # This prevents premature truncation from spurious early EOS tokens
-            if i > length_guesstimate:
-                # Scan all generated_ids for EOS — matches single mode behavior
-                # Single mode: (generated_ids == stop_token_tensor).any()
-                # Batch mode: per-item check across all generated positions
+            # Per-item EOS check: only check items past their individual guesstimate
+            past_guesstimate = (i > per_item_guesstimate)  # [input_batch_size]
+            if past_guesstimate.any():
                 has_eos = (generated_ids == stop_token_tensor).any(dim=1)  # [input_batch_size]
-                finished_mask = finished_mask | has_eos
+                newly_finished = past_guesstimate & has_eos
+                finished_mask = finished_mask | newly_finished
 
-                # Early exit if all items finished
                 if finished_mask.all():
                     break
 
@@ -968,7 +972,7 @@ def generate_t3_token_batch(
     max_position: Optional[int] = None,
     attention_mask: Optional[Tensor] = None,
     cache_position: Optional[Tensor] = None,
-    suppress_eos_token_id: Optional[int] = None,
+    suppress_eos_mask: Optional[Tensor] = None,
 ):
     """
     Batch-aware token generation for multiple inputs simultaneously.
@@ -978,6 +982,7 @@ def generate_t3_token_batch(
         finished_mask: Boolean tensor tracking which batch items have generated EOS
         stop_token_tensor: Pre-allocated tensor for stop token (required for CUDA graphs)
         attention_mask: Optional 2D mask (eff_batch, max_cache_len) for batch padding
+        suppress_eos_mask: Optional bool tensor [input_batch_size] — True = suppress EOS for that item
     """
     # logits shape: (effective_batch_size, 1, vocab_size) -> (effective_batch_size, vocab_size)
     logits = output_logits[:, -1, :]
@@ -996,10 +1001,10 @@ def generate_t3_token_batch(
     if temperature != 1.0:
         logits = logits / temperature
 
-    # Suppress EOS during early generation to prevent spurious EOS sampling.
-    # The model stays in-distribution instead of generating post-EOS hallucinations.
-    if suppress_eos_token_id is not None:
-        logits[:, suppress_eos_token_id] = float('-inf')
+    # Suppress EOS per-item during early generation to prevent spurious EOS sampling.
+    # Only items still within their length_guesstimate have EOS suppressed.
+    if suppress_eos_mask is not None and stop_token_id is not None:
+        logits[suppress_eos_mask, stop_token_id] = float('-inf')
 
     logits = min_p_warper(None, logits)
     logits = top_p_warper(None, logits)
