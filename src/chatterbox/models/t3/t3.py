@@ -810,6 +810,15 @@ class T3(nn.Module):
                 if finished_mask.all():
                     break
 
+        # Mask out spurious EOS tokens before length_guesstimate.
+        # The generation loop ignores EOS before this threshold (matching single mode),
+        # but the tokens are still written to generated_ids. Remove them so
+        # drop_invalid_tokens won't truncate at a spurious early EOS.
+        # Position 0 is SOS, generated tokens start at position 1.
+        eos_guard_end = min(length_guesstimate + 1, generated_ids.shape[1])  # +1 for SOS offset
+        early_region = generated_ids[:, 1:eos_guard_end]
+        early_region[early_region == self.hp.stop_speech_token] = self.hp.start_speech_token
+
         return generated_ids
 
 

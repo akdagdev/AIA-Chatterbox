@@ -668,9 +668,24 @@ class ChatterboxMultilingualTTS:
             # Use FP16 S3Gen copies (copy 0 = FP32, reserved for embed_ref)
             s3gen_workers = self.s3gen_copies[1:] if len(self.s3gen_copies) > 1 else [self.s3gen]
 
+            # Minimum tokens needed for S3Gen (HiFiGAN f0_predictor Conv1d kernel_size=3
+            # needs at least 2 mel frames → 1 token, but 3 tokens is a safe minimum)
+            MIN_SPEECH_TOKENS = 3
+
             results = []
             for i in range(batch_size):
                 valid_tokens = drop_invalid_tokens(speech_tokens[i]).to(self.device)
+
+                if len(valid_tokens) < MIN_SPEECH_TOKENS:
+                    # Too few tokens for S3Gen — return silence
+                    import logging
+                    logging.warning(
+                        f"Batch item {i} has only {len(valid_tokens)} valid speech tokens "
+                        f"(min={MIN_SPEECH_TOKENS}), returning silence"
+                    )
+                    results.append(torch.zeros(1, int(0.1 * self.sr)))
+                    continue
+
                 valid_wav_len = len(valid_tokens) * 2 * 480
 
                 # Round-robin across FP16 copies
