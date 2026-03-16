@@ -757,6 +757,7 @@ class T3(nn.Module):
 
         for i in tqdm(range(max_new_tokens), desc="Batch Sampling", dynamic_ncols=True):
             i_tensor = indices[i]
+            cache_pos = torch.tensor([seq_len + i], device=device)
 
             next_token, output_logits = generate_token_batch(
                 self._speech_embedding_cache,
@@ -777,6 +778,7 @@ class T3(nn.Module):
                 stop_token_id=self.hp.stop_speech_token,
                 stop_token_tensor=pre_stop_token_tensor,
                 attention_mask=attn_mask,
+                cache_position=cache_pos,
             )
             output_logits = output_logits.clone()
 
@@ -973,6 +975,7 @@ def generate_t3_token_batch(
     stop_token_tensor: Tensor = None,  # Pre-allocated for CUDA graph compatibility
     max_position: Optional[int] = None,
     attention_mask: Optional[Tensor] = None,
+    cache_position: Optional[Tensor] = None,
 ):
     """
     Batch-aware token generation for multiple inputs simultaneously.
@@ -1026,10 +1029,15 @@ def generate_t3_token_batch(
     if cfg_weight > 0.0:
         next_token_embed = torch.cat([next_token_embed, next_token_embed], dim=0)
 
+    # Use explicit cache_position if provided; fallback to get_seq_length() heuristic.
+    # get_seq_length() counts non-zero keys in item 0, which undercounts when item 0
+    # has zero-embedding padding — causing cache overwrites and corrupted output.
+    effective_cache_pos = cache_position if cache_position is not None else kv_cache.get_seq_length().unsqueeze(0)
+
     return next_token, patched_model(
         inputs_embeds=next_token_embed,
         past_key_values=kv_cache,
-        cache_position=kv_cache.get_seq_length().unsqueeze(0),
+        cache_position=effective_cache_pos,
         max_position=max_position,
         attention_mask=attention_mask,
     )
