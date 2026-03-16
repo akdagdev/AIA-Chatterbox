@@ -123,6 +123,8 @@ When batch items have different text lengths, the tokenizer pads shorter items. 
 
 **Why this works:** Llama uses `bias=False` throughout (attention projections, MLP). Zero embeddings produce zero K/V vectors: `K[pad] = W_k @ 0 = 0`, `V[pad] = W_v @ 0 = 0`. Regardless of attention weights, `weight * 0 = 0` — padded positions contribute nothing to the output. The model effectively "doesn't see" them.
 
+**Do NOT** pass an `attention_mask` to Llama's forward call for batch mode — it changes the softmax distribution compared to single mode (which never uses one). The model was trained without attention masking, so adding one causes corrupted audio. Embedding zeroing alone is sufficient.
+
 **Do NOT** replace PAD tokens with EOT — this creates `[SOT, t1, t2, EOT, EOT, EOT]` sequences that destabilize T3's attention patterns and cause stuttering/hallucinations.
 
 ### Batch vs Single EOS Handling

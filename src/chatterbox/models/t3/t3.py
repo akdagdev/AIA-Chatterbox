@@ -691,27 +691,11 @@ class T3(nn.Module):
             dtype=self.patched_model.dtype,
         )
 
-        # Build full-sequence attention mask: 1=attend, 0=ignore
-        # Shape: (effective_batch_size, max_cache_len)
-        if text_attention_mask is not None:
-            text_len = text_tokens.shape[1]
-            attn_mask = torch.ones(effective_batch_size, max_cache_len, device=device, dtype=torch.long)
-
-            # Mark padded text positions as 0 (don't attend)
-            text_start = len_cond
-            text_end = len_cond + text_len
-
-            # For CFG: conditioned half uses real mask, unconditioned half masks ALL text
-            if cfg_weight > 0:
-                cond_text_mask = text_attention_mask[:input_batch_size]
-                uncond_text_mask = torch.ones_like(cond_text_mask)
-                full_text_mask = torch.cat([cond_text_mask, uncond_text_mask], dim=0)
-            else:
-                full_text_mask = text_attention_mask
-
-            attn_mask[:, text_start:text_end] = full_text_mask
-        else:
-            attn_mask = None
+        # Padding is handled via embedding zeroing in prepare_input_embeds (line 134-136).
+        # With bias=False Llama, zero embeddings → zero K/V → zero contribution.
+        # Do NOT pass an attention_mask to Llama: it changes the softmax distribution
+        # vs. single mode (which never uses one), causing corrupted audio.
+        attn_mask = None
 
         # Initial forward pass
         cache_position = torch.arange(seq_len, device=device)
@@ -719,7 +703,6 @@ class T3(nn.Module):
             inputs_embeds=inputs_embeds[:, :seq_len, :],
             past_key_values=kv_cache,
             cache_position=cache_position,
-            attention_mask=attn_mask,
         )
         output_logits = output_logits[:, -1:, :].clone()
 
@@ -753,11 +736,7 @@ class T3(nn.Module):
                     input_batch_size,
                     self.hp.stop_speech_token,
                     pre_stop_token_tensor,
-                    attention_mask=attn_mask,
                 )
-            else:
-                # Update attention_mask for reused wrapper (different batch content)
-                self.batch_cudagraph_wrapper.attention_mask = attn_mask
             self.batch_cudagraph_wrapper.guard()
             generate_token_batch = self.batch_cudagraph_wrapper
         else:
@@ -792,7 +771,6 @@ class T3(nn.Module):
                 stop_token_id=self.hp.stop_speech_token,
                 stop_token_tensor=pre_stop_token_tensor,
                 max_position=max_position,
-                attention_mask=attn_mask,
             )
             output_logits = output_logits.clone()
 
@@ -988,11 +966,10 @@ def generate_t3_token_batch(
     stop_token_id: int = None,
     stop_token_tensor: Tensor = None,  # Pre-allocated for CUDA graph compatibility
     max_position: Optional[int] = None,
-    attention_mask: Optional[Tensor] = None,
 ):
     """
     Batch-aware token generation for multiple inputs simultaneously.
-    
+
     Args:
         input_batch_size: Number of actual input texts (before CFG doubling)
         finished_mask: Boolean tensor tracking which batch items have generated EOS
@@ -1046,7 +1023,6 @@ def generate_t3_token_batch(
         past_key_values=kv_cache,
         cache_position=kv_cache.get_seq_length().unsqueeze(0),
         max_position=max_position,
-        attention_mask=attention_mask,
     )
 
 _generate_token_batch_variants = {
