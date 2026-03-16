@@ -131,7 +131,7 @@ Additionally, a **symmetric attention mask** is passed to Llama's forward call: 
 
 **Do NOT** replace PAD tokens with EOT — this creates `[SOT, t1, t2, EOT, EOT, EOT]` sequences that destabilize T3's attention patterns and cause stuttering/hallucinations.
 
-**Batch uses eager mode (no CUDA graphs)** — CUDA graph capture with batch attention masks produces corrupted output (first batch with each new size returns 0 valid tokens). Eager mode runs at ~50-80 it/s vs ~130 it/s with graphs. Batch is still faster than sequential single-item processing.
+**Batch uses CUDA graphs** — the attention mask is static within each `inference_batch()` call and is captured as a CUDA graph static tensor alongside `cache_position`. The batch KV cache is reused across calls (reset, not recreated) to preserve graph captures. Graph capture occurs once on the first generation step (~30ms), then replays at ~130 it/s for subsequent steps. Falls back to eager on non-CUDA devices (MPS).
 
 ### Batch vs Single EOS Handling
 

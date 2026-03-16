@@ -310,13 +310,15 @@ class T3(nn.Module):
         return self._direct_cache
 
     def get_cache_batch(self, config, max_batch_size, max_cache_len, device, dtype):
-        """Always create a fresh cache for batch inference.
-        Eliminates stale state from StaticCache's get_seq_length() heuristic
-        (counts non-zero key positions, fragile with zero-embedding batches)."""
+        """Batch cache — reuse when shape matches, only recreate when params change.
+        We use explicit cache_position instead of get_seq_length(), so reuse is safe."""
         if hasattr(self, '_batch_cache'):
+            if self._params_match(self._batch_cache_params, max_batch_size, max_cache_len, device, dtype):
+                self._batch_cache.reset()
+                return self._batch_cache
             del self._batch_cache
-        if hasattr(self, 'batch_cudagraph_wrapper'):
-            del self.batch_cudagraph_wrapper
+            if hasattr(self, 'batch_cudagraph_wrapper'):
+                del self.batch_cudagraph_wrapper
         self._batch_cache, self._batch_cache_params = self._make_cache(
             config, max_batch_size, max_cache_len, device, dtype)
         return self._batch_cache
@@ -730,18 +732,17 @@ class T3(nn.Module):
         # Pre-allocate stop_token_tensor for CUDA graph compatibility
         pre_stop_token_tensor = torch.tensor([[self.hp.stop_speech_token]], device=device, dtype=torch.long)
 
-        # Select generation backend: eager when attention_mask is present.
-        # CUDA graph capture with batch attention masks produces corrupted output
-        # (first batch with new size returns 0 valid tokens). Eager mode is ~50-80 it/s
-        # vs ~130 it/s with graphs, but batch is still faster than sequential single.
-        use_eager = attn_mask is not None
+        # Select generation backend: CUDA graphs when on GPU, eager otherwise.
+        # The attention mask is static within each inference_batch() call and is
+        # captured as a CUDA graph static tensor alongside cache_position.
         is_cuda = device.type == "cuda"
 
-        if is_cuda and not use_eager:
+        if is_cuda:
             # Use CUDA Graphs for optimized generation.
             # CUDA_CAPTURE_LOCK in t3_cuda_graphs prevents capture/STT conflicts.
             if not hasattr(self, "batch_cudagraph_wrapper") or \
-               self.batch_cudagraph_wrapper.input_batch_size != input_batch_size:
+               self.batch_cudagraph_wrapper.input_batch_size != input_batch_size or \
+               self.batch_cudagraph_wrapper.kv_cache is not kv_cache:
                 from .t3_cuda_graphs import T3BatchStepCUDAGraphWrapper
                 self.batch_cudagraph_wrapper = T3BatchStepCUDAGraphWrapper(
                     generate_t3_token_batch,
@@ -759,9 +760,12 @@ class T3(nn.Module):
         else:
             generate_token_batch = generate_t3_token_batch
 
+        # Pre-allocate cache_position tensor — updated in-place each iteration
+        cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
+
         for i in tqdm(range(max_new_tokens), desc="Batch Sampling", dynamic_ncols=True):
             i_tensor = indices[i]
-            cache_pos = torch.tensor([seq_len + i], device=device)
+            cache_pos.fill_(seq_len + i)
 
             next_token, output_logits = generate_token_batch(
                 self._speech_embedding_cache,

@@ -277,6 +277,8 @@ class T3BatchStepCUDAGraphWrapper:
         temperature: float,
         finished_mask: torch.Tensor,
         max_position: Optional[int] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        cache_position: Optional[torch.Tensor] = None,
     ) -> None:
         print(f"Capturing CUDA graph for batch bucket {bucket_key}")
 
@@ -297,6 +299,8 @@ class T3BatchStepCUDAGraphWrapper:
             static_tensors["temperature"] = temperature
             static_tensors["finished_mask"] = finished_mask.clone()
             static_tensors["max_position"] = bucket_key
+            static_tensors["attention_mask"] = attention_mask.clone() if attention_mask is not None else None
+            static_tensors["cache_position"] = cache_position.clone() if cache_position is not None else None
 
             with torch.inference_mode():
                 with torch.cuda.graph(self._bucket_graphs[bucket_key]):
@@ -319,6 +323,8 @@ class T3BatchStepCUDAGraphWrapper:
                         self.stop_token_id,
                         self.stop_token_tensor,
                         static_tensors["max_position"],
+                        static_tensors["attention_mask"],
+                        static_tensors["cache_position"],
                     )
 
             self._bucket_static_tensors[bucket_key] = static_tensors
@@ -365,6 +371,8 @@ class T3BatchStepCUDAGraphWrapper:
                 temperature,
                 finished_mask,
                 max_position,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
             )
             # Copy static generated_ids back to original after first capture
             static_tensors = self._bucket_static_tensors[bucket_key]
@@ -381,6 +389,10 @@ class T3BatchStepCUDAGraphWrapper:
             static_tensors["cfg_weight"] = cfg_weight
             static_tensors["temperature"] = temperature
             static_tensors["max_position"] = max_position
+            if static_tensors["attention_mask"] is not None and attention_mask is not None:
+                static_tensors["attention_mask"].copy_(attention_mask)
+            if static_tensors["cache_position"] is not None and cache_position is not None:
+                static_tensors["cache_position"].copy_(cache_position)
 
             self._bucket_graphs[bucket_key].replay()
 
