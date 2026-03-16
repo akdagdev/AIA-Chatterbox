@@ -714,7 +714,7 @@ class T3(nn.Module):
         else:
             attn_mask = None
 
-        # Initial forward pass
+        # Initial forward pass (uses 2D mask — runs outside CUDA graph, only once)
         cache_position = torch.arange(seq_len, device=device)
         output_logits = self.patched_model(
             inputs_embeds=inputs_embeds[:, :seq_len, :],
@@ -723,6 +723,26 @@ class T3(nn.Module):
             attention_mask=attn_mask,
         )
         output_logits = output_logits[:, -1:, :].clone()
+
+        # Pre-compute 4D attention mask for the generation loop.
+        # When dim()==4, the model's _prepare_4d_causal_attention_mask_with_cache_position
+        # returns it directly — zero intermediate allocations. This makes the
+        # generation step CUDA-graph-safe (2D masks trigger torch.full, torch.arange,
+        # clone, masked_fill, etc. inside the model which corrupt CUDA graph capture).
+        if attn_mask is not None:
+            model_dtype = self.patched_model.dtype
+            min_dtype = torch.finfo(model_dtype).min
+            # Shape: (effective_batch_size, 1, 1, max_cache_len)
+            gen_attn_mask = torch.full(
+                (effective_batch_size, 1, 1, max_cache_len),
+                min_dtype, dtype=model_dtype, device=device,
+            )
+            # Unmask initial context positions (0..seq_len-1) where not padding.
+            # attn_mask has 1=real, 0=pad. We want 0.0=unmasked, min_dtype=masked.
+            real_mask = attn_mask[:, :seq_len].to(dtype=model_dtype)
+            gen_attn_mask[:, 0, 0, :seq_len] = min_dtype * (1.0 - real_mask)
+        else:
+            gen_attn_mask = None
 
         # EOS tracking per batch item
         finished_mask = torch.zeros(input_batch_size, dtype=torch.bool, device=device)
@@ -733,7 +753,7 @@ class T3(nn.Module):
         pre_stop_token_tensor = torch.tensor([[self.hp.stop_speech_token]], device=device, dtype=torch.long)
 
         # Select generation backend: CUDA graphs when on GPU, eager otherwise.
-        # The attention mask is static within each inference_batch() call and is
+        # The 4D attention mask is static within each inference_batch() call and is
         # captured as a CUDA graph static tensor alongside cache_position.
         is_cuda = device.type == "cuda"
 
@@ -767,6 +787,10 @@ class T3(nn.Module):
             i_tensor = indices[i]
             cache_pos.fill_(seq_len + i)
 
+            # Unmask new position in 4D mask (generated tokens are always real)
+            if gen_attn_mask is not None:
+                gen_attn_mask[:, 0, 0, seq_len + i] = 0.0
+
             next_token, output_logits = generate_token_batch(
                 self._speech_embedding_cache,
                 output_logits,
@@ -785,7 +809,7 @@ class T3(nn.Module):
                 finished_mask,
                 stop_token_id=self.hp.stop_speech_token,
                 stop_token_tensor=pre_stop_token_tensor,
-                attention_mask=attn_mask,
+                attention_mask=gen_attn_mask,
                 cache_position=cache_pos,
             )
             output_logits = output_logits.clone()
