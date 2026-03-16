@@ -56,7 +56,9 @@ text + language_id
 
 `ChatterboxMultilingualTTS` creates **4 S3Gen copies** at load time:
 - Copy 0: FP32 — used exclusively for `embed_ref()` (voice embedding extraction)
-- Copies 1–3: FP16 — used for parallel waveform inference in batch mode
+- Copies 1–3: FP16 — used for per-item sequential waveform inference in batch mode (round-robin)
+
+**Batch S3Gen uses per-item sequential inference**, not tensor batching. UpsampleConformerEncoder's O(T²) attention causes OOM when batching (8 items × 400 tokens → ~655 MiB attention scores). Per-item with FP16 copies reduces this to ~41 MiB. Net batch latency impact: ~2s slower but avoids OOM entirely.
 
 ### CUDA Graph Acceleration
 
