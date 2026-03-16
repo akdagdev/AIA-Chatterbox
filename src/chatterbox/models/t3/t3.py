@@ -704,7 +704,7 @@ class T3(nn.Module):
             # For CFG: conditioned half uses real mask, unconditioned half masks ALL text
             if cfg_weight > 0:
                 cond_text_mask = text_attention_mask[:input_batch_size]
-                uncond_text_mask = torch.zeros_like(cond_text_mask)
+                uncond_text_mask = torch.ones_like(cond_text_mask)
                 full_text_mask = torch.cat([cond_text_mask, uncond_text_mask], dim=0)
             else:
                 full_text_mask = text_attention_mask
