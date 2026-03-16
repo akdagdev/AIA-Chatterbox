@@ -779,6 +779,7 @@ class T3(nn.Module):
                 stop_token_tensor=pre_stop_token_tensor,
                 attention_mask=attn_mask,
                 cache_position=cache_pos,
+                suppress_eos_token_id=self.hp.stop_speech_token if i <= length_guesstimate else None,
             )
             output_logits = output_logits.clone()
 
@@ -795,15 +796,6 @@ class T3(nn.Module):
                 # Early exit if all items finished
                 if finished_mask.all():
                     break
-
-        # Mask out spurious EOS tokens before length_guesstimate.
-        # The generation loop ignores EOS before this threshold (matching single mode),
-        # but the tokens are still written to generated_ids. Remove them so
-        # drop_invalid_tokens won't truncate at a spurious early EOS.
-        # Position 0 is SOS, generated tokens start at position 1.
-        eos_guard_end = min(length_guesstimate + 1, generated_ids.shape[1])  # +1 for SOS offset
-        early_region = generated_ids[:, 1:eos_guard_end]
-        early_region[early_region == self.hp.stop_speech_token] = self.hp.start_speech_token
 
         return generated_ids
 
@@ -976,6 +968,7 @@ def generate_t3_token_batch(
     max_position: Optional[int] = None,
     attention_mask: Optional[Tensor] = None,
     cache_position: Optional[Tensor] = None,
+    suppress_eos_token_id: Optional[int] = None,
 ):
     """
     Batch-aware token generation for multiple inputs simultaneously.
@@ -1002,6 +995,11 @@ def generate_t3_token_batch(
 
     if temperature != 1.0:
         logits = logits / temperature
+
+    # Suppress EOS during early generation to prevent spurious EOS sampling.
+    # The model stays in-distribution instead of generating post-EOS hallucinations.
+    if suppress_eos_token_id is not None:
+        logits[:, suppress_eos_token_id] = float('-inf')
 
     logits = min_p_warper(None, logits)
     logits = top_p_warper(None, logits)
