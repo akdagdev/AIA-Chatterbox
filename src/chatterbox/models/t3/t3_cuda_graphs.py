@@ -321,8 +321,8 @@ class T3BatchStepCUDAGraphWrapper:
 
             with torch.inference_mode():
                 warmup_gen_ids = static_tensors["generated_ids"].clone()
-                for _ in range(3):
-                    self.generate_token_batch(
+                for wi in range(3):
+                    warmup_out1, _ = self.generate_token_batch(
                         static_tensors["speech_embedding_cache"],
                         static_tensors["output_logits"].clone(),
                         static_tensors["i_tensor"],
@@ -344,6 +344,7 @@ class T3BatchStepCUDAGraphWrapper:
                         static_tensors["attention_mask"],
                         static_tensors["cache_position"],
                     )
+                    print(f"[DBG] warmup[{wi}] tokens={warmup_out1.flatten().tolist()}")
                     warmup_gen_ids.copy_(static_tensors["generated_ids"])
             del warmup_gen_ids
 
@@ -382,6 +383,8 @@ class T3BatchStepCUDAGraphWrapper:
 
             self._bucket_static_tensors[bucket_key] = static_tensors
             self._captured_buckets.add(bucket_key)
+            torch.cuda.synchronize()
+            print(f"[DBG] capture tokens={static_tensors['out_1'].flatten().tolist()} stop={self.stop_token_id}")
         finally:
             if lock:
                 lock.release()
