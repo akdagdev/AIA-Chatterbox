@@ -1,7 +1,91 @@
 import torch
 from typing import Optional, Tuple, Callable, Any, Dict
 
+from transformers.cache_utils import StaticLayer, StaticCache, Cache
+
 TOKEN_LIMIT = 1500
+
+
+class FlexibleStaticLayer(StaticLayer):
+    """StaticLayer that pre-allocates keys/values at max_batch_size.
+
+    The default StaticLayer lazily determines batch size from the first key_states
+    passed to update(). If a small-batch call (e.g. effective=2) initialises the
+    layer first, a later larger-batch call (effective=4) will fail in index_copy_()
+    because all non-indexed dims must match between source and destination:
+
+        Destination slice [2, 16, 64]  ≠  Source slice [4, 16, 64]
+
+    This subclass overrides lazy_initialization to allocate at _max_batch regardless
+    of the actual key_states batch size, and overrides update to write/read only the
+    [:actual_batch] slice of the buffer, making any batch ≤ _max_batch safe.
+    """
+
+    def __init__(self, max_cache_len: int, max_batch_size: int):
+        super().__init__(max_cache_len)
+        self._max_batch = max_batch_size
+
+    def lazy_initialization(self, key_states: torch.Tensor) -> None:
+        _, self.num_heads, _, self.head_dim = key_states.shape
+        self.max_batch_size = self._max_batch
+        self.dtype = key_states.dtype
+        self.device = key_states.device
+        self.keys = torch.zeros(
+            (self._max_batch, self.num_heads, self.max_cache_len, self.head_dim),
+            dtype=self.dtype, device=self.device,
+        )
+        self.values = torch.zeros(
+            (self._max_batch, self.num_heads, self.max_cache_len, self.head_dim),
+            dtype=self.dtype, device=self.device,
+        )
+        try:
+            from torch._dynamo import is_compiling as _is_compiling
+            if not _is_compiling():
+                torch._dynamo.mark_static_address(self.keys)
+                torch._dynamo.mark_static_address(self.values)
+        except Exception:
+            pass
+        self.is_initialized = True
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, cache_kwargs=None):
+        if not self.is_initialized:
+            self.lazy_initialization(key_states)
+
+        cache_position = (cache_kwargs or {}).get("cache_position")
+        if cache_position is None:
+            cache_position = torch.arange(key_states.shape[-2], device=self.device)
+
+        # Slice to actual_batch so index_copy_'s dim-0 requirement is satisfied
+        actual_batch = key_states.shape[0]
+        try:
+            self.keys[:actual_batch].index_copy_(2, cache_position, key_states)
+            self.values[:actual_batch].index_copy_(2, cache_position, value_states)
+        except NotImplementedError:
+            # MPS fallback
+            self.keys[:actual_batch, :, cache_position] = key_states
+            self.values[:actual_batch, :, cache_position] = value_states
+
+        return self.keys[:actual_batch], self.values[:actual_batch]
+
+
+class FlexibleStaticCache(StaticCache):
+    """StaticCache composed of FlexibleStaticLayer instances.
+
+    Allows a single shared cache to serve any effective batch size ≤ max_batch_size
+    without OOM from per-size pre-allocation.
+    """
+
+    def __init__(self, config, max_batch_size: int, max_cache_len: int, **kwargs):
+        # Build layers manually, bypassing StaticCache.__init__ which creates
+        # plain StaticLayer objects that don't handle variable batch.
+        config_text = config.get_text_config(decoder=True)
+        num_layers = config_text.num_hidden_layers
+        layers = [
+            FlexibleStaticLayer(max_cache_len=max_cache_len, max_batch_size=max_batch_size)
+            for _ in range(num_layers)
+        ]
+        # Initialise via Cache.__init__ (grandparent) — passes layers through
+        Cache.__init__(self, layers=layers)
 
 # Set externally by the host application (e.g. AI-Server) to prevent CUDA graph
 # captures from running concurrently with other CUDA operations (like STT inference).

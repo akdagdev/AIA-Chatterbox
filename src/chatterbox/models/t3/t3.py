@@ -26,7 +26,7 @@ from ..utils import AttrDict
 
 from .fast_min_p_warper import FastMinPLogitsWarper
 from .fast_top_p_warper import FastTopPLogitsWarper
-from .t3_cuda_graphs import T3StepCUDAGraphWrapper, T3BatchStepCUDAGraphWrapper, PrefillCUDAGraphWrapper, get_next_bucket
+from .t3_cuda_graphs import T3StepCUDAGraphWrapper, T3BatchStepCUDAGraphWrapper, PrefillCUDAGraphWrapper, get_next_bucket, FlexibleStaticCache
 
 logger = logging.getLogger(__name__)
 
@@ -339,10 +339,23 @@ class T3(nn.Module):
         return self._direct_cache
 
     def get_cache_batch(self, config, max_batch_size, max_cache_len, device, dtype):
-        """Single shared batch cache at MAX_BATCH_EFF size — all per-batch-size wrappers share it.
-        CUDA graphs capture tensor addresses at creation time, so all wrappers must be created
-        against the same cache object. Using max size avoids per-batch-size allocation that
-        caused OOM when multiple batch sizes were seen in a session (~221 MB × N unique sizes)."""
+        """Single shared batch cache at MAX_BATCH_EFF using FlexibleStaticCache.
+
+        FlexibleStaticCache pre-allocates key/value buffers at max_batch_size once,
+        then serves any actual_batch ≤ max_batch via [:actual_batch] slicing in
+        StaticLayer.update(). This avoids two failure modes:
+
+        1. OOM from per-size caches: old _batch_caches dict kept a separate
+           StaticCache per unique effective_batch_size (~176 MB × effective per cache).
+           Four sizes (effective 8,12,14,16) = ~8.8 GB, exhausting a 24 GB card.
+
+        2. index_copy_() shape crash: the new transformers StaticLayer lazily
+           initialises from key_states.shape[0], so a small first batch (effective=2)
+           would set max_batch=2; a later larger batch (effective=4) would then fail
+           with "Destination slice [2,16,64] ≠ Source slice [4,16,64]".
+
+        FlexibleStaticLayer fixes both: one allocation at max_batch=16, sliced per call.
+        """
         _MAX_BATCH_EFF = 16  # 8 batch items × CFG factor 2
         fixed_max = max(_MAX_BATCH_EFF, max_batch_size)
         if hasattr(self, '_batch_cache'):
@@ -356,8 +369,17 @@ class T3(nn.Module):
             del self._batch_cache
             if hasattr(self, '_batch_cudagraph_wrappers'):
                 self._batch_cudagraph_wrappers.clear()
-        self._batch_cache, self._batch_cache_params = self._make_cache(
-            config, fixed_max, max_cache_len, device, dtype)
+        self._batch_cache = FlexibleStaticCache(
+            config=config,
+            max_batch_size=fixed_max,
+            max_cache_len=max_cache_len,
+        )
+        self._batch_cache_params = {
+            'max_batch_size': fixed_max,
+            'max_cache_len': max_cache_len,
+            'device': device,
+            'dtype': dtype,
+        }
         return self._batch_cache
 
     def get_speech_pos_embedding_cache(self, max_gen_tokens, dtype):
