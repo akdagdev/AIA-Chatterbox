@@ -3,6 +3,10 @@ from typing import List, Union, Optional, Dict
 from pathlib import Path
 import os
 import threading
+import time
+import logging
+
+_log = logging.getLogger(__name__)
 
 import librosa
 import torch
@@ -361,7 +365,9 @@ class ChatterboxMultilingualTTS:
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
+        t0 = time.perf_counter()
         with torch.inference_mode():
+            t_t3_start = time.perf_counter()
             speech_tokens = self.t3.inference(
                 t3_cond=conds.t3,
                 text_tokens=text_tokens,
@@ -374,6 +380,8 @@ class ChatterboxMultilingualTTS:
                 top_p=top_p,
                 **t3_params,
             )
+            t_t3 = time.perf_counter() - t_t3_start
+
             # Extract only the conditional batch.
             speech_tokens = speech_tokens[0]
 
@@ -381,12 +389,24 @@ class ChatterboxMultilingualTTS:
             speech_tokens = drop_invalid_tokens(speech_tokens)
             speech_tokens = speech_tokens.to(self.device)
 
+            t_s3_start = time.perf_counter()
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
                 ref_dict=conds.gen,
             )
+            t_s3 = time.perf_counter() - t_s3_start
+
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+
+        total = time.perf_counter() - t0
+        n_tokens = len(speech_tokens)
+        audio_dur = n_tokens * 2 * 480 / self.sr
+        _log.info(
+            f"[SINGLE] T3={t_t3:.3f}s ({n_tokens} tokens, {n_tokens/t_t3:.0f} tok/s) | "
+            f"S3Gen={t_s3:.3f}s | total={total:.3f}s | "
+            f"audio={audio_dur:.2f}s | RTF={total/audio_dur:.3f}"
+        )
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
     def generate_batch(
@@ -643,8 +663,10 @@ class ChatterboxMultilingualTTS:
                 ).to(device=self.device)
                 t3_cond_to_use = cfg_t3_cond
 
+        t0 = time.perf_counter()
         with torch.inference_mode():
             # T3 batch inference
+            t_t3_start = time.perf_counter()
             speech_tokens = self.t3.inference_batch(
                 t3_cond=t3_cond_to_use,
                 text_tokens=text_tokens,
@@ -657,7 +679,8 @@ class ChatterboxMultilingualTTS:
                 min_p=min_p,
                 top_p=top_p,
             )
-            
+            t_t3 = time.perf_counter() - t_t3_start
+
             # Replace PAD tokens with EOS — safety net for items that didn't generate EOS.
             # Without this, PAD (6563) passes through drop_invalid_tokens → 60s garbage audio.
             PAD_TOKEN_ID = self.t3.hp.stop_speech_token + 1  # 6563
@@ -677,33 +700,45 @@ class ChatterboxMultilingualTTS:
             MIN_SPEECH_TOKENS = 3
 
             results = []
+            t_s3_total = 0.0
+            token_counts = []
             for i in range(batch_size):
                 valid_tokens = drop_invalid_tokens(speech_tokens[i]).to(self.device)
                 valid_tokens = valid_tokens[valid_tokens < SPEECH_VOCAB_SIZE]
 
                 if len(valid_tokens) < MIN_SPEECH_TOKENS:
-                    # Too few tokens for S3Gen — return silence
-                    import logging
-                    logging.warning(
+                    _log.warning(
                         f"Batch item {i} has only {len(valid_tokens)} valid speech tokens "
                         f"(min={MIN_SPEECH_TOKENS}), returning silence"
                     )
                     results.append(torch.zeros(1, int(0.1 * self.sr)))
+                    token_counts.append(0)
                     continue
 
                 valid_wav_len = len(valid_tokens) * 2 * 480
+                token_counts.append(len(valid_tokens))
 
                 # Round-robin across FP16 copies
                 worker = s3gen_workers[i % len(s3gen_workers)]
 
+                t_s3_item = time.perf_counter()
                 wav, _ = worker.inference(
                     speech_tokens=valid_tokens,
                     ref_dict=item_ref_dicts[i],
                 )
+                t_s3_total += time.perf_counter() - t_s3_item
 
                 curr_wav = wav.squeeze(0)[:valid_wav_len]
                 wav_numpy = curr_wav.detach().cpu().numpy()
                 watermarked_wav = self.watermarker.apply_watermark(wav_numpy, sample_rate=self.sr)
                 results.append(torch.from_numpy(watermarked_wav).unsqueeze(0))
 
-            return results
+        total = time.perf_counter() - t0
+        total_tokens = sum(token_counts)
+        total_audio = sum(n * 2 * 480 / self.sr for n in token_counts)
+        _log.info(
+            f"[BATCH={batch_size}] T3={t_t3:.3f}s ({total_tokens} tokens, {total_tokens/t_t3:.0f} tok/s) | "
+            f"S3Gen={t_s3_total:.3f}s (per-item avg {t_s3_total/max(batch_size,1):.3f}s) | "
+            f"total={total:.3f}s | audio={total_audio:.2f}s | RTF={total/max(total_audio,1e-6):.3f}"
+        )
+        return results
