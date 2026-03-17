@@ -26,7 +26,7 @@ from ..utils import AttrDict
 
 from .fast_min_p_warper import FastMinPLogitsWarper
 from .fast_top_p_warper import FastTopPLogitsWarper
-from .t3_cuda_graphs import T3StepCUDAGraphWrapper, T3BatchStepCUDAGraphWrapper, PrefillCUDAGraphWrapper, get_next_bucket
+from .t3_cuda_graphs import T3StepCUDAGraphWrapper, T3BatchStepCUDAGraphWrapper, get_next_bucket
 
 logger = logging.getLogger(__name__)
 
@@ -302,11 +302,9 @@ class T3(nn.Module):
                 self._direct_cache.reset()
                 return self._direct_cache
             del self._direct_cache
-            # Direct cache params changed — invalidate direct wrappers only.
+            # Direct cache params changed — invalidate direct wrapper only.
             if hasattr(self, 'cudagraph_wrapper'):
                 del self.cudagraph_wrapper
-            if hasattr(self, 'prefill_wrapper'):
-                del self.prefill_wrapper
         self._direct_cache, self._direct_cache_params = self._make_cache(
             config, max_batch_size, max_cache_len, device, dtype)
         return self._direct_cache
@@ -496,6 +494,7 @@ class T3(nn.Module):
             "Cannot process large input when cache already has content"
 
         length_guesstimate = text_tokens.shape[1] * 2
+        print(f"Estimated token count: {length_guesstimate}")
 
         # ---- Pad input_embeds to fixed length for compilation stability ----
         # This ensures that input_embeds always has the same shape for torch.compile
@@ -509,25 +508,19 @@ class T3(nn.Module):
 
             return inputs_embeds
         
-        # ---- Initial Forward Pass (prefill) ----
-        # On CUDA: use PrefillCUDAGraphWrapper — buckets seq_len to 64/128/256/512,
-        # pads with zeros, captures once per bucket, replays in ~1ms thereafter.
-        # Off CUDA (MPS/CPU): eager fallback via _initial_forward_pass.
-        if self.device.type == "cuda" and generate_token_backend == "cudagraphs-manual":
-            if not hasattr(self, "prefill_wrapper"):
-                self.prefill_wrapper = PrefillCUDAGraphWrapper(self.patched_model, kv_cache)
-            output_logits = self.prefill_wrapper(inputs_embeds, seq_len).clone()
-        else:
-            inputs_embeds = pad_to_fixed_length(inputs_embeds, TOKEN_LIMIT)
-            initial_forward_pass = _initial_forward_pass_variants.get(
-                initial_forward_pass_backend, _initial_forward_pass_variants["eager"]
-            )
-            output_logits = initial_forward_pass(
-                inputs_embeds=inputs_embeds,
-                kv_cache=kv_cache,
-                seq_len=seq_len,
-                patched_model=self.patched_model,
-            ).clone()
+        print(f"Input embeds shape before padding: {inputs_embeds.shape}")
+
+        inputs_embeds = pad_to_fixed_length(inputs_embeds, TOKEN_LIMIT)
+
+        # ---- Initial Forward Pass (no kv_cache yet) ----
+        initial_forward_pass = _initial_forward_pass_variants.get(initial_forward_pass_backend, _initial_forward_pass_variants["eager"])
+
+        output_logits = initial_forward_pass(
+            inputs_embeds=inputs_embeds,
+            kv_cache=kv_cache,
+            seq_len=seq_len,
+            patched_model=self.patched_model
+        ).clone()  # Clone to avoid in-place modification issues
 
 
         indices = torch.arange(1, max_new_tokens + 1, device=generated_ids.device)
