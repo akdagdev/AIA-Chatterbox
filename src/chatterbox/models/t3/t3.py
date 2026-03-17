@@ -26,7 +26,7 @@ from ..utils import AttrDict
 
 from .fast_min_p_warper import FastMinPLogitsWarper
 from .fast_top_p_warper import FastTopPLogitsWarper
-from .t3_cuda_graphs import T3StepCUDAGraphWrapper, T3BatchStepCUDAGraphWrapper, PrefillCUDAGraphWrapper, get_next_bucket, FlexibleStaticCache
+from .t3_cuda_graphs import T3StepCUDAGraphWrapper, T3BatchStepCUDAGraphWrapper, get_next_bucket
 
 logger = logging.getLogger(__name__)
 
@@ -266,33 +266,6 @@ class T3(nn.Module):
             self.patched_model = patched_model
             self.compiled = True
 
-    def warmup_prefill_graphs(self, max_cache_len: int = 1500):
-        """Pre-capture all PrefillCUDAGraphWrapper buckets at model-load time.
-
-        Called once from ChatterboxMultilingualTTS.from_local() so that the first
-        real inference() call never triggers a slow CUDA graph capture.
-        Requires init_patched_model() to have been called already.
-        """
-        if self.device.type != "cuda":
-            return
-        device = self.patched_model.device
-        dtype = self.patched_model.dtype
-        hidden = self.patched_model.config.hidden_size
-        # Ensure the direct cache exists (same object inference() will use)
-        kv_cache = self.get_cache_direct(
-            config=self.patched_model.config,
-            max_batch_size=2,  # always 2 for CFG
-            max_cache_len=max_cache_len,
-            device=device,
-            dtype=dtype,
-        )
-        wrapper = PrefillCUDAGraphWrapper(self.patched_model, kv_cache)
-        with torch.inference_mode():
-            for bucket in [64, 128, 256, 512]:
-                dummy = torch.zeros(2, bucket, hidden, dtype=dtype, device=device)
-                wrapper(dummy, bucket)   # triggers _capture for each bucket
-        self.prefill_wrapper = wrapper
-
     def _make_cache(self, config, max_batch_size, max_cache_len, device, dtype):
         cache = StaticCache(
             config=config,
@@ -329,57 +302,25 @@ class T3(nn.Module):
                 self._direct_cache.reset()
                 return self._direct_cache
             del self._direct_cache
-            # Direct cache params changed — invalidate direct wrappers only.
+            # Direct cache params changed — invalidate direct wrapper only.
             if hasattr(self, 'cudagraph_wrapper'):
                 del self.cudagraph_wrapper
-            if hasattr(self, 'prefill_wrapper'):
-                del self.prefill_wrapper
         self._direct_cache, self._direct_cache_params = self._make_cache(
             config, max_batch_size, max_cache_len, device, dtype)
         return self._direct_cache
 
     def get_cache_batch(self, config, max_batch_size, max_cache_len, device, dtype):
-        """Single shared batch cache at MAX_BATCH_EFF using FlexibleStaticCache.
-
-        FlexibleStaticCache pre-allocates key/value buffers at max_batch_size once,
-        then serves any actual_batch ≤ max_batch via [:actual_batch] slicing in
-        StaticLayer.update(). This avoids two failure modes:
-
-        1. OOM from per-size caches: old _batch_caches dict kept a separate
-           StaticCache per unique effective_batch_size (~176 MB × effective per cache).
-           Four sizes (effective 8,12,14,16) = ~8.8 GB, exhausting a 24 GB card.
-
-        2. index_copy_() shape crash: the new transformers StaticLayer lazily
-           initialises from key_states.shape[0], so a small first batch (effective=2)
-           would set max_batch=2; a later larger batch (effective=4) would then fail
-           with "Destination slice [2,16,64] ≠ Source slice [4,16,64]".
-
-        FlexibleStaticLayer fixes both: one allocation at max_batch=16, sliced per call.
-        """
-        _MAX_BATCH_EFF = 16  # 8 batch items × CFG factor 2
-        fixed_max = max(_MAX_BATCH_EFF, max_batch_size)
+        """Batch cache — reuse when shape matches, only recreate when params change.
+        We use explicit cache_position instead of get_seq_length(), so reuse is safe."""
         if hasattr(self, '_batch_cache'):
-            params = self._batch_cache_params
-            if (params['max_batch_size'] == fixed_max and
-                    params['max_cache_len'] == max_cache_len and
-                    params['device'] == device and params['dtype'] == dtype):
+            if self._params_match(self._batch_cache_params, max_batch_size, max_cache_len, device, dtype):
                 self._batch_cache.reset()
                 return self._batch_cache
-            # Device/dtype/len changed — must recreate; all wrappers are now invalid
             del self._batch_cache
-            if hasattr(self, '_batch_cudagraph_wrappers'):
-                self._batch_cudagraph_wrappers.clear()
-        self._batch_cache = FlexibleStaticCache(
-            config=config,
-            max_batch_size=fixed_max,
-            max_cache_len=max_cache_len,
-        )
-        self._batch_cache_params = {
-            'max_batch_size': fixed_max,
-            'max_cache_len': max_cache_len,
-            'device': device,
-            'dtype': dtype,
-        }
+            if hasattr(self, 'batch_cudagraph_wrapper'):
+                del self.batch_cudagraph_wrapper
+        self._batch_cache, self._batch_cache_params = self._make_cache(
+            config, max_batch_size, max_cache_len, device, dtype)
         return self._batch_cache
 
     def get_speech_pos_embedding_cache(self, max_gen_tokens, dtype):
@@ -553,6 +494,7 @@ class T3(nn.Module):
             "Cannot process large input when cache already has content"
 
         length_guesstimate = text_tokens.shape[1] * 2
+        print(f"Estimated token count: {length_guesstimate}")
 
         # ---- Pad input_embeds to fixed length for compilation stability ----
         # This ensures that input_embeds always has the same shape for torch.compile
@@ -566,25 +508,19 @@ class T3(nn.Module):
 
             return inputs_embeds
         
-        # ---- Initial Forward Pass (prefill) ----
-        # On CUDA: use PrefillCUDAGraphWrapper — buckets seq_len to 64/128/256/512,
-        # pads with zeros, captures once per bucket, replays in ~1ms thereafter.
-        # Off CUDA (MPS/CPU): eager fallback via _initial_forward_pass.
-        if self.device.type == "cuda" and generate_token_backend == "cudagraphs-manual":
-            if not hasattr(self, "prefill_wrapper"):
-                self.prefill_wrapper = PrefillCUDAGraphWrapper(self.patched_model, kv_cache)
-            output_logits = self.prefill_wrapper(inputs_embeds, seq_len).clone()
-        else:
-            inputs_embeds = pad_to_fixed_length(inputs_embeds, TOKEN_LIMIT)
-            initial_forward_pass = _initial_forward_pass_variants.get(
-                initial_forward_pass_backend, _initial_forward_pass_variants["eager"]
-            )
-            output_logits = initial_forward_pass(
-                inputs_embeds=inputs_embeds,
-                kv_cache=kv_cache,
-                seq_len=seq_len,
-                patched_model=self.patched_model,
-            ).clone()
+        print(f"Input embeds shape before padding: {inputs_embeds.shape}")
+
+        inputs_embeds = pad_to_fixed_length(inputs_embeds, TOKEN_LIMIT)
+
+        # ---- Initial Forward Pass (no kv_cache yet) ----
+        initial_forward_pass = _initial_forward_pass_variants.get(initial_forward_pass_backend, _initial_forward_pass_variants["eager"])
+
+        output_logits = initial_forward_pass(
+            inputs_embeds=inputs_embeds,
+            kv_cache=kv_cache,
+            seq_len=seq_len,
+            patched_model=self.patched_model
+        ).clone()  # Clone to avoid in-place modification issues
 
 
         indices = torch.arange(1, max_new_tokens + 1, device=generated_ids.device)
@@ -829,10 +765,8 @@ class T3(nn.Module):
         # throughput GPU-speed-independent.
         # torch.compile fails with StaticCache weakref invalidation during AOT autograd
         # functionalization (confirmed on torch 2.10) — manual CUDA graphs bypass this.
-        if not hasattr(self, "_batch_cudagraph_wrappers"):
-            self._batch_cudagraph_wrappers = {}
-        if input_batch_size not in self._batch_cudagraph_wrappers:
-            self._batch_cudagraph_wrappers[input_batch_size] = T3BatchStepCUDAGraphWrapper(
+        if not hasattr(self, "batch_cudagraph_wrapper"):
+            self.batch_cudagraph_wrapper = T3BatchStepCUDAGraphWrapper(
                 generate_t3_token_batch,
                 self.patched_model,
                 kv_cache,
@@ -843,7 +777,7 @@ class T3(nn.Module):
                 stop_token_id=self.hp.stop_speech_token,
                 stop_token_tensor=pre_stop_token_tensor,
             )
-        generate_token_batch = self._batch_cudagraph_wrappers[input_batch_size]
+        generate_token_batch = self.batch_cudagraph_wrapper
 
         # Pre-allocate cache_position tensor — updated in-place each iteration
         cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
