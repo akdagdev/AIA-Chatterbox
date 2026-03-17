@@ -215,7 +215,7 @@ class ChatterboxMultilingualTTS:
             s3gen_copy.to(device)
             if i > 0:  # Only non-primary copies use FP16
                 s3gen_copy.half()
-                if device.type == "cuda":
+                if str(device).startswith("cuda"):
                     s3gen_copy.flow = torch.compile(s3gen_copy.flow, mode="reduce-overhead")
                     s3gen_copy.mel2wav = torch.compile(s3gen_copy.mel2wav, mode="reduce-overhead")
             s3gen_copy.eval()
