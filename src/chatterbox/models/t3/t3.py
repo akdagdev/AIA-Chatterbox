@@ -339,25 +339,26 @@ class T3(nn.Module):
         return self._direct_cache
 
     def get_cache_batch(self, config, max_batch_size, max_cache_len, device, dtype):
-        """Batch cache — one cache per max_batch_size, reused across calls.
-        Caches for other batch sizes are never deleted so their CUDA graph wrappers survive.
-        We use explicit cache_position instead of get_seq_length(), so reuse is safe."""
-        if not hasattr(self, '_batch_caches'):
-            self._batch_caches = {}
-        key = max_batch_size
-        if key in self._batch_caches:
-            cache, params = self._batch_caches[key]
-            if self._params_match(params, max_batch_size, max_cache_len, device, dtype):
-                cache.reset()
-                return cache
-            # Params changed for this batch size (dtype/device change) — recreate
-            del self._batch_caches[key]
-            wrappers = getattr(self, '_batch_cudagraph_wrappers', {})
-            if key in wrappers:
-                del wrappers[key]
-        cache, params = self._make_cache(config, max_batch_size, max_cache_len, device, dtype)
-        self._batch_caches[key] = (cache, params)
-        return cache
+        """Single shared batch cache at MAX_BATCH_EFF size — all per-batch-size wrappers share it.
+        CUDA graphs capture tensor addresses at creation time, so all wrappers must be created
+        against the same cache object. Using max size avoids per-batch-size allocation that
+        caused OOM when multiple batch sizes were seen in a session (~221 MB × N unique sizes)."""
+        _MAX_BATCH_EFF = 16  # 8 batch items × CFG factor 2
+        fixed_max = max(_MAX_BATCH_EFF, max_batch_size)
+        if hasattr(self, '_batch_cache'):
+            params = self._batch_cache_params
+            if (params['max_batch_size'] == fixed_max and
+                    params['max_cache_len'] == max_cache_len and
+                    params['device'] == device and params['dtype'] == dtype):
+                self._batch_cache.reset()
+                return self._batch_cache
+            # Device/dtype/len changed — must recreate; all wrappers are now invalid
+            del self._batch_cache
+            if hasattr(self, '_batch_cudagraph_wrappers'):
+                self._batch_cudagraph_wrappers.clear()
+        self._batch_cache, self._batch_cache_params = self._make_cache(
+            config, fixed_max, max_cache_len, device, dtype)
+        return self._batch_cache
 
     def get_speech_pos_embedding_cache(self, max_gen_tokens, dtype):
         if not hasattr(self, '_speech_pos_embedding_cache') or self._speech_pos_embedding_cache.size(0) < max_gen_tokens:
