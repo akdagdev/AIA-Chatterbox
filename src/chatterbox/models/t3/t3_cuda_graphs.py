@@ -228,6 +228,127 @@ class T3StepCUDAGraphWrapper:
         self.kv_cache.reset()
 
 
+# Bucket sizes for prefill seq_len. Must cover all realistic input lengths.
+# Typical T3 single-mode seq_len = conditioning (~30) + text (~20-200) + BOS (1) ≈ 50-230.
+PREFILL_BUCKETS = [64, 128, 256, 512]
+
+
+class PrefillCUDAGraphWrapper:
+    """
+    CUDA graph for the T3 initial forward pass (prefill).
+
+    The prefill runs once per generation to process text+conditioning through all Llama
+    layers and fill the KV cache. seq_len varies per call (different text lengths), so
+    we bucket to fixed sizes to make capture possible.
+
+    Strategy: right-pad inputs_embeds with zeros to the bucket size.
+    - Real tokens at positions 0..seq_len-1 get correct RoPE.
+    - Padded zeros produce zero K/V (Llama uses bias=False throughout).
+    - Causal mask prevents real tokens from attending to future padded positions.
+    - Output is captured for all bucket positions; post-graph we slice [:, seq_len-1, :].
+
+    The kv_cache is the shared _direct_cache from T3. After the prefill graph runs,
+    KV slots 0..bucket-1 are filled (real at 0..seq_len-1, zeros at seq_len..bucket-1).
+    The generation loop starts at cache_position=seq_len and overwrites any zero slots.
+    """
+
+    def __init__(self, patched_model, kv_cache):
+        self.patched_model = patched_model
+        self.kv_cache = kv_cache
+        self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
+        self._static: Dict[int, dict] = {}
+        self._captured: set = set()
+
+    @staticmethod
+    def _get_bucket(seq_len: int) -> Optional[int]:
+        for b in PREFILL_BUCKETS:
+            if seq_len <= b:
+                return b
+        return None  # seq_len too long for any bucket → eager fallback
+
+    def __call__(
+        self,
+        inputs_embeds: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """
+        inputs_embeds: [batch, ≥seq_len, hidden] — may be pre-padded to TOKEN_LIMIT
+        seq_len: actual sequence length (without TOKEN_LIMIT padding)
+        Returns: logits [batch, 1, vocab_size] for position seq_len-1
+        """
+        bucket = self._get_bucket(seq_len)
+        if bucket is None:
+            # Fallback for unusually long prompts (seq_len > 512): run eager
+            cache_position = torch.arange(seq_len, device=inputs_embeds.device)
+            out = self.patched_model(
+                inputs_embeds=inputs_embeds[:, :seq_len, :],
+                past_key_values=self.kv_cache,
+                cache_position=cache_position,
+            )
+            return out[:, -1:, :]
+
+        if bucket not in self._captured:
+            self._capture(bucket, inputs_embeds, seq_len)
+        else:
+            static = self._static[bucket]
+            # Zero the padding region, copy real embeddings
+            static["embeds"].zero_()
+            static["embeds"][:, :seq_len, :].copy_(inputs_embeds[:, :seq_len, :])
+            self._graphs[bucket].replay()
+
+        # Post-graph slice: extract logit for the last real token (Python-side, free)
+        return self._static[bucket]["out"][:, seq_len - 1 : seq_len, :].clone()
+
+    def _capture(self, bucket: int, inputs_embeds: torch.Tensor, seq_len: int):
+        batch, hidden = inputs_embeds.shape[0], inputs_embeds.shape[2]
+        device = inputs_embeds.device
+        dtype = inputs_embeds.dtype
+
+        static_embeds = torch.zeros(batch, bucket, hidden, dtype=dtype, device=device)
+        static_embeds[:, :seq_len, :].copy_(inputs_embeds[:, :seq_len, :])
+        static_cache_pos = torch.arange(bucket, device=device, dtype=torch.long)
+
+        lock = CUDA_CAPTURE_LOCK
+        if lock:
+            lock.acquire()
+        try:
+            with torch.inference_mode():
+                # 3 warmup passes to heat cuBLAS kernels before capture
+                for _ in range(3):
+                    self.kv_cache.reset()
+                    self.patched_model(
+                        inputs_embeds=static_embeds,
+                        past_key_values=self.kv_cache,
+                        cache_position=static_cache_pos,
+                    )
+                self.kv_cache.reset()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    static_out = self.patched_model(
+                        inputs_embeds=static_embeds,
+                        past_key_values=self.kv_cache,
+                        cache_position=static_cache_pos,
+                    )
+            torch.cuda.synchronize()
+        finally:
+            if lock:
+                lock.release()
+
+        self._graphs[bucket] = graph
+        self._static[bucket] = {
+            "embeds": static_embeds,
+            "cache_pos": static_cache_pos,
+            "out": static_out,
+        }
+        self._captured.add(bucket)
+
+    def reset(self):
+        self._graphs.clear()
+        self._static.clear()
+        self._captured.clear()
+
+
 class T3BatchStepCUDAGraphWrapper:
     """
     CUDA Graph wrapper for batch token generation.
