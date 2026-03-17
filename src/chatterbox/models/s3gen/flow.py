@@ -266,7 +266,7 @@ class MaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=5,
+            n_timesteps=10,
             prompt_len=mel_len1, # Decoder needs to know where to start generating? 
                                  # If implementation relies on single int prompt_len, batching variable prompt is HARD.
                                  # We might need to check decoder implementation.
@@ -476,7 +476,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=5
+            n_timesteps=10
         )
         
         # Slice output
