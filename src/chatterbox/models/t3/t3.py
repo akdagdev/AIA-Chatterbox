@@ -760,12 +760,21 @@ class T3(nn.Module):
         # Pre-allocate stop_token_tensor for CUDA graph compatibility
         pre_stop_token_tensor = torch.tensor([[self.hp.stop_speech_token]], device=device, dtype=torch.long)
 
-        # Batch always uses eager — manual CUDA graph capture corrupts output, and
-        # torch.compile fails with StaticCache weak reference invalidation during
-        # AOT autograd functionalization when patched_model is passed as argument.
+        # torch.compile(generate_t3_token_batch) fails — AOT autograd functionalization
+        # loses the weakref to cache_position's storage when patched_model is included.
+        # Instead, compile only patched_model for batch use: the heavy forward pass gets
+        # CUDA graph tree capture, while the Python sampling wrapper stays uncompiled.
+        # Single mode's T3StepCUDAGraphWrapper continues to use uncompiled self.patched_model.
         # gen_max_position clips KV cache reads to actual generation range (up to 3×
         # speedup vs the full 1500-bucket default: e.g., bucket 500 vs 1500).
-        generate_token_batch = generate_t3_token_batch
+        if device.type == "cuda":
+            if not hasattr(self, "_batch_compiled_model"):
+                self._batch_compiled_model = torch.compile(
+                    self.patched_model, mode="reduce-overhead"
+                )
+            batch_model = self._batch_compiled_model
+        else:
+            batch_model = self.patched_model
 
         # Pre-allocate cache_position tensor — updated in-place each iteration
         cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
@@ -790,7 +799,7 @@ class T3(nn.Module):
                 self.repetition_penalty_processor,
                 self.min_p_warper,
                 self.top_p_warper,
-                self.patched_model,
+                batch_model,
                 kv_cache,
                 input_batch_size,
                 finished_mask,
