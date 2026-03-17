@@ -221,8 +221,13 @@ class ChatterboxMultilingualTTS:
             if i > 0:  # Only non-primary copies use FP16
                 s3gen_copy.half()
                 if str(device).startswith("cuda"):
-                    s3gen_copy.flow = torch.compile(s3gen_copy.flow, mode="reduce-overhead")
-                    s3gen_copy.mel2wav = torch.compile(s3gen_copy.mel2wav, mode="reduce-overhead")
+                    # "default" mode (not "reduce-overhead"): no internal CUDA graph trees →
+                    # thread-safe, respects torch.cuda.stream() context from worker threads →
+                    # enables true GPU parallelism across 3 copies on separate streams.
+                    # "reduce-overhead" binds graphs to the capture stream (default) and
+                    # silently serializes all thread calls there regardless of stream context.
+                    s3gen_copy.flow = torch.compile(s3gen_copy.flow, mode="default")
+                    s3gen_copy.mel2wav = torch.compile(s3gen_copy.mel2wav, mode="default")
             s3gen_copy.eval()
             s3gen_copies.append(s3gen_copy)
         
@@ -236,6 +241,12 @@ class ChatterboxMultilingualTTS:
         conds = None
         if (builtin_voice := ckpt_dir / "conds.pt").exists():
             conds = Conditionals.load(builtin_voice).to(device)
+
+        # Pre-warm T3 prefill CUDA graphs for all bucket sizes so that the first
+        # real inference call never triggers a slow capture mid-conversation.
+        if str(device).startswith("cuda"):
+            t3.init_patched_model()
+            t3.warmup_prefill_graphs()
 
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds, s3gen_copies=s3gen_copies)
 

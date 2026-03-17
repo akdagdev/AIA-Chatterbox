@@ -266,6 +266,33 @@ class T3(nn.Module):
             self.patched_model = patched_model
             self.compiled = True
 
+    def warmup_prefill_graphs(self, max_cache_len: int = 1500):
+        """Pre-capture all PrefillCUDAGraphWrapper buckets at model-load time.
+
+        Called once from ChatterboxMultilingualTTS.from_local() so that the first
+        real inference() call never triggers a slow CUDA graph capture.
+        Requires init_patched_model() to have been called already.
+        """
+        if self.device.type != "cuda":
+            return
+        device = self.patched_model.device
+        dtype = self.patched_model.dtype
+        hidden = self.patched_model.config.hidden_size
+        # Ensure the direct cache exists (same object inference() will use)
+        kv_cache = self.get_cache_direct(
+            config=self.patched_model.config,
+            max_batch_size=2,  # always 2 for CFG
+            max_cache_len=max_cache_len,
+            device=device,
+            dtype=dtype,
+        )
+        wrapper = PrefillCUDAGraphWrapper(self.patched_model, kv_cache)
+        with torch.inference_mode():
+            for bucket in [64, 128, 256, 512]:
+                dummy = torch.zeros(2, bucket, hidden, dtype=dtype, device=device)
+                wrapper(dummy, bucket)   # triggers _capture for each bucket
+        self.prefill_wrapper = wrapper
+
     def _make_cache(self, config, max_batch_size, max_cache_len, device, dtype):
         cache = StaticCache(
             config=config,
