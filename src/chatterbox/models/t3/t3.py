@@ -339,18 +339,25 @@ class T3(nn.Module):
         return self._direct_cache
 
     def get_cache_batch(self, config, max_batch_size, max_cache_len, device, dtype):
-        """Batch cache — reuse when shape matches, only recreate when params change.
+        """Batch cache — one cache per max_batch_size, reused across calls.
+        Caches for other batch sizes are never deleted so their CUDA graph wrappers survive.
         We use explicit cache_position instead of get_seq_length(), so reuse is safe."""
-        if hasattr(self, '_batch_cache'):
-            if self._params_match(self._batch_cache_params, max_batch_size, max_cache_len, device, dtype):
-                self._batch_cache.reset()
-                return self._batch_cache
-            del self._batch_cache
-            if hasattr(self, 'batch_cudagraph_wrapper'):
-                del self.batch_cudagraph_wrapper
-        self._batch_cache, self._batch_cache_params = self._make_cache(
-            config, max_batch_size, max_cache_len, device, dtype)
-        return self._batch_cache
+        if not hasattr(self, '_batch_caches'):
+            self._batch_caches = {}
+        key = max_batch_size
+        if key in self._batch_caches:
+            cache, params = self._batch_caches[key]
+            if self._params_match(params, max_batch_size, max_cache_len, device, dtype):
+                cache.reset()
+                return cache
+            # Params changed for this batch size (dtype/device change) — recreate
+            del self._batch_caches[key]
+            wrappers = getattr(self, '_batch_cudagraph_wrappers', {})
+            if key in wrappers:
+                del wrappers[key]
+        cache, params = self._make_cache(config, max_batch_size, max_cache_len, device, dtype)
+        self._batch_caches[key] = (cache, params)
+        return cache
 
     def get_speech_pos_embedding_cache(self, max_gen_tokens, dtype):
         if not hasattr(self, '_speech_pos_embedding_cache') or self._speech_pos_embedding_cache.size(0) < max_gen_tokens:
@@ -799,8 +806,10 @@ class T3(nn.Module):
         # throughput GPU-speed-independent.
         # torch.compile fails with StaticCache weakref invalidation during AOT autograd
         # functionalization (confirmed on torch 2.10) — manual CUDA graphs bypass this.
-        if not hasattr(self, "batch_cudagraph_wrapper"):
-            self.batch_cudagraph_wrapper = T3BatchStepCUDAGraphWrapper(
+        if not hasattr(self, "_batch_cudagraph_wrappers"):
+            self._batch_cudagraph_wrappers = {}
+        if input_batch_size not in self._batch_cudagraph_wrappers:
+            self._batch_cudagraph_wrappers[input_batch_size] = T3BatchStepCUDAGraphWrapper(
                 generate_t3_token_batch,
                 self.patched_model,
                 kv_cache,
@@ -811,7 +820,7 @@ class T3(nn.Module):
                 stop_token_id=self.hp.stop_speech_token,
                 stop_token_tensor=pre_stop_token_tensor,
             )
-        generate_token_batch = self.batch_cudagraph_wrapper
+        generate_token_batch = self._batch_cudagraph_wrappers[input_batch_size]
 
         # Pre-allocate cache_position tensor — updated in-place each iteration
         cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
