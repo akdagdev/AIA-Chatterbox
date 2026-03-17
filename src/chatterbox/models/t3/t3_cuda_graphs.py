@@ -311,9 +311,10 @@ class T3BatchStepCUDAGraphWrapper:
             if cache_position is not None:
                 warmup_cache_pos = int(cache_position.item())
                 kv_slot_saves = [
-                    (key[:, :, warmup_cache_pos, :].clone(),
-                     val[:, :, warmup_cache_pos, :].clone())
-                    for key, val in zip(self.kv_cache.key_cache, self.kv_cache.value_cache)
+                    (layer.keys[:, :, warmup_cache_pos, :].clone(),
+                     layer.values[:, :, warmup_cache_pos, :].clone())
+                    for layer in self.kv_cache.layers
+                    if layer.is_initialized
                 ]
             else:
                 kv_slot_saves = None
@@ -348,13 +349,10 @@ class T3BatchStepCUDAGraphWrapper:
 
             # Restore the KV slot overwritten during warmup
             if kv_slot_saves is not None:
-                for (key_s, val_s), key, val in zip(
-                    kv_slot_saves,
-                    self.kv_cache.key_cache,
-                    self.kv_cache.value_cache,
-                ):
-                    key[:, :, warmup_cache_pos, :].copy_(key_s)
-                    val[:, :, warmup_cache_pos, :].copy_(val_s)
+                initialized_layers = [l for l in self.kv_cache.layers if l.is_initialized]
+                for (key_s, val_s), layer in zip(kv_slot_saves, initialized_layers):
+                    layer.keys[:, :, warmup_cache_pos, :].copy_(key_s)
+                    layer.values[:, :, warmup_cache_pos, :].copy_(val_s)
                 del kv_slot_saves
 
             with torch.inference_mode():
