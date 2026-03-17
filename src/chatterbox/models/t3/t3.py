@@ -760,11 +760,15 @@ class T3(nn.Module):
         # Pre-allocate stop_token_tensor for CUDA graph compatibility
         pre_stop_token_tensor = torch.tensor([[self.hp.stop_speech_token]], device=device, dtype=torch.long)
 
-        # Batch always uses eager — CUDA graph capture produces unreliable output
-        # (first call returns silence for all items regardless of mask format).
+        # Manual CUDA graph capture (T3BatchStepCUDAGraphWrapper) produces corrupted output.
+        # Instead use torch.compile(mode="reduce-overhead") which internally uses CUDA graph
+        # trees — a more robust mechanism that handles dynamic state (finished_mask, etc).
         # gen_max_position clips KV cache reads to actual generation range (up to 3×
         # speedup vs the full 1500-bucket default: e.g., bucket 500 vs 1500).
-        generate_token_batch = generate_t3_token_batch
+        if device.type == "cuda":
+            generate_token_batch = _generate_token_batch_variants["reduce-overhead"]
+        else:
+            generate_token_batch = generate_t3_token_batch
 
         # Pre-allocate cache_position tensor — updated in-place each iteration
         cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
@@ -806,7 +810,9 @@ class T3(nn.Module):
             # detection only wastes loop iterations without affecting audio quality.
             newly_eos = (next_token.squeeze(1) == self.hp.stop_speech_token)
             finished_mask = finished_mask | newly_eos
-            if finished_mask.all():
+            # Check every 5 steps — .all() forces GPU-CPU sync, checking every step
+            # keeps the GPU stalled on Python overhead regardless of GPU speed.
+            if i % 5 == 4 and finished_mask.all():
                 break
 
         return generated_ids
