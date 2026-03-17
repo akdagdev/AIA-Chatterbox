@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List, Union, Optional, Dict
 from pathlib import Path
 import os
+import concurrent.futures
 import threading
 import time
 import logging
@@ -695,42 +696,78 @@ class ChatterboxMultilingualTTS:
 
             # Use FP16 S3Gen copies (copy 0 = FP32, reserved for embed_ref)
             s3gen_workers = self.s3gen_copies[1:] if len(self.s3gen_copies) > 1 else [self.s3gen]
+            n_workers = len(s3gen_workers)
 
             # Minimum tokens needed for S3Gen (HiFiGAN f0_predictor Conv1d kernel_size=3
             # needs at least 2 mel frames → 1 token, but 3 tokens is a safe minimum)
             MIN_SPEECH_TOKENS = 3
 
-            results = []
-            t_s3_total = 0.0
+            # Pre-extract valid tokens for all items
+            item_valid_tokens = []
             token_counts = []
             for i in range(batch_size):
                 valid_tokens = drop_invalid_tokens(speech_tokens[i]).to(self.device)
                 valid_tokens = valid_tokens[valid_tokens < SPEECH_VOCAB_SIZE]
+                item_valid_tokens.append(valid_tokens)
+                token_counts.append(len(valid_tokens) if len(valid_tokens) >= MIN_SPEECH_TOKENS else 0)
 
-                if len(valid_tokens) < MIN_SPEECH_TOKENS:
+            use_cuda_streams = torch.cuda.is_available()
+
+            # Lazy-init per-worker CUDA streams (one per FP16 copy, reused across batches)
+            if use_cuda_streams:
+                if not hasattr(self, '_s3gen_streams') or len(self._s3gen_streams) != n_workers:
+                    self._s3gen_streams = [torch.cuda.Stream() for _ in range(n_workers)]
+
+            # Group items by worker (round-robin)
+            worker_queues = [[] for _ in range(n_workers)]
+            for i in range(batch_size):
+                if token_counts[i] > 0:
+                    worker_queues[i % n_workers].append(i)
+
+            # Each worker processes its assigned items sequentially on its own CUDA stream.
+            # Workers run concurrently → ~n_workers× S3Gen speedup.
+            raw_wavs = {}  # item_idx → tensor on GPU
+
+            def run_worker(worker_idx, item_indices):
+                worker = s3gen_workers[worker_idx]
+                stream = self._s3gen_streams[worker_idx] if use_cuda_streams else None
+                for idx in item_indices:
+                    tokens = item_valid_tokens[idx]
+                    if stream is not None:
+                        with torch.cuda.stream(stream):
+                            wav, _ = worker.inference(
+                                speech_tokens=tokens,
+                                ref_dict=item_ref_dicts[idx],
+                            )
+                        stream.synchronize()
+                    else:
+                        wav, _ = worker.inference(
+                            speech_tokens=tokens,
+                            ref_dict=item_ref_dicts[idx],
+                        )
+                    raw_wavs[idx] = wav.squeeze(0)[: len(tokens) * 2 * 480]
+
+            t_s3_start = time.perf_counter()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futs = [
+                    executor.submit(run_worker, w, worker_queues[w])
+                    for w in range(n_workers)
+                ]
+                for f in futs:
+                    f.result()  # re-raise any exceptions
+            t_s3_total = time.perf_counter() - t_s3_start
+
+            # Assemble results in original order, apply watermark (CPU-side, safe)
+            results = []
+            for i in range(batch_size):
+                if token_counts[i] == 0:
                     _log.warning(
-                        f"Batch item {i} has only {len(valid_tokens)} valid speech tokens "
+                        f"Batch item {i} has only {len(item_valid_tokens[i])} valid speech tokens "
                         f"(min={MIN_SPEECH_TOKENS}), returning silence"
                     )
                     results.append(torch.zeros(1, int(0.1 * self.sr)))
-                    token_counts.append(0)
                     continue
-
-                valid_wav_len = len(valid_tokens) * 2 * 480
-                token_counts.append(len(valid_tokens))
-
-                # Round-robin across FP16 copies
-                worker = s3gen_workers[i % len(s3gen_workers)]
-
-                t_s3_item = time.perf_counter()
-                wav, _ = worker.inference(
-                    speech_tokens=valid_tokens,
-                    ref_dict=item_ref_dicts[i],
-                )
-                t_s3_total += time.perf_counter() - t_s3_item
-
-                curr_wav = wav.squeeze(0)[:valid_wav_len]
-                wav_numpy = curr_wav.detach().cpu().numpy()
+                wav_numpy = raw_wavs[i].detach().cpu().numpy()
                 watermarked_wav = self.watermarker.apply_watermark(wav_numpy, sample_rate=self.sr)
                 results.append(torch.from_numpy(watermarked_wav).unsqueeze(0))
 
