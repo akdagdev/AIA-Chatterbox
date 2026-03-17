@@ -131,13 +131,12 @@ Additionally, a **symmetric attention mask** is passed to Llama's forward call: 
 
 **Do NOT** replace PAD tokens with EOT — this creates `[SOT, t1, t2, EOT, EOT, EOT]` sequences that destabilize T3's attention patterns and cause stuttering/hallucinations.
 
-**Batch uses eager mode (no CUDA graphs)** — CUDA graph capture for batch mode produces corrupted output (first call with each new batch size returns 0 valid speech tokens for all items), regardless of mask format (2D or 4D). Eager mode runs at ~66-80 it/s vs ~130 it/s with graphs, but is still faster than sequential single-item processing.
+**Batch uses CUDA graphs** via `T3BatchStepCUDAGraphWrapper`. Root cause of the historic "0 valid tokens" bug: `torch.multinomial` inside `torch.cuda.graph()` capture context returns token 0 regardless of logits. Fix: `__call__` saves `original_gen_ids` before calling `_capture_graph_for_bucket`, then immediately runs one eager pass with `original_gen_ids` after capture to get the real first token. All subsequent steps use graph replay normally. Batch CUDA graphs run at ~130 it/s vs ~66-80 it/s in eager mode.
 
 **gen_max_position optimization** — the generation loop uses `gen_max_position = get_next_bucket(seq_len + max_new_tokens)` (the smallest bucket covering the actual generation range) instead of the full cache size. KV cache reads scale linearly with max_position, so using bucket 500 instead of 1500 gives ~3× fewer reads for typical short texts, yielding meaningful speedup within eager mode.
 
 **4D attention mask in generation loop** — the 2D attention mask is used for the initial forward pass (prefill), then converted to a 4D mask `(batch, 1, 1, gen_max_position)` for the generation loop. Updated per-step by unmasking one new position. This is necessary for correctness (not for CUDA graph compatibility) — passing a 2D mask during generation would re-trigger `_prepare_4d_causal_attention_mask_with_cache_position` each step with dynamic shape allocations.
 
-**Do NOT** attempt to re-enable CUDA graphs for batch mode — capture-time execution consistently produces 0 valid tokens across multiple capture strategies (pre-warmup, step-0-eager, 4D masks). The root cause is that complex batch state (finished_mask, force-EOS logic, CFG duplication) makes capture-time execution unreliable in ways that differ from single-mode.
 
 ### Batch vs Single EOS Handling
 

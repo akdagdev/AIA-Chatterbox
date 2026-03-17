@@ -344,7 +344,6 @@ class T3BatchStepCUDAGraphWrapper:
                         static_tensors["attention_mask"],
                         static_tensors["cache_position"],
                     )
-                    print(f"[DBG] warmup[{wi}] tokens={warmup_out1.flatten().tolist()}")
                     warmup_gen_ids.copy_(static_tensors["generated_ids"])
             del warmup_gen_ids
 
@@ -384,7 +383,6 @@ class T3BatchStepCUDAGraphWrapper:
             self._bucket_static_tensors[bucket_key] = static_tensors
             self._captured_buckets.add(bucket_key)
             torch.cuda.synchronize()
-            print(f"[DBG] capture tokens={static_tensors['out_1'].flatten().tolist()} stop={self.stop_token_id}")
         finally:
             if lock:
                 lock.release()
@@ -415,6 +413,10 @@ class T3BatchStepCUDAGraphWrapper:
         bucket_key = max_position or TOKEN_LIMIT
 
         if bucket_key not in self._captured_buckets:
+            # Save generated_ids before capture — CUDA graph context makes multinomial
+            # return token 0 during capture, corrupting static_tensors["out_1"].
+            original_gen_ids = generated_ids.clone()
+
             self._capture_graph_for_bucket(
                 bucket_key,
                 speech_embedding_cache,
@@ -430,9 +432,35 @@ class T3BatchStepCUDAGraphWrapper:
                 attention_mask=attention_mask,
                 cache_position=cache_position,
             )
-            # Copy static generated_ids back to original after first capture
-            static_tensors = self._bucket_static_tensors[bucket_key]
-            generated_ids.copy_(static_tensors["generated_ids"])
+
+            # Graph is captured for future replays. Run one eager pass with the
+            # original (pre-capture) generated_ids to get the real first token.
+            with torch.inference_mode():
+                real_out_1, real_out_2 = self.generate_token_batch(
+                    speech_embedding_cache,
+                    output_logits,
+                    i_tensor,
+                    batch_idx,
+                    speech_pos_embedding_cache,
+                    original_gen_ids,
+                    cfg_weight,
+                    temperature,
+                    self.repetition_penalty_processor,
+                    self.min_p_warper,
+                    self.top_p_warper,
+                    self.patched_model,
+                    self.kv_cache,
+                    self.input_batch_size,
+                    finished_mask,
+                    self.stop_token_id,
+                    self.stop_token_tensor,
+                    max_position,
+                    attention_mask,
+                    cache_position,
+                )
+            # Sync generated_ids with the real token so the loop state is correct
+            generated_ids.copy_(original_gen_ids)
+            return (real_out_1, real_out_2)
         else:
             static_tensors = self._bucket_static_tensors[bucket_key]
             # Only copy tensors that change between iterations.
