@@ -389,8 +389,10 @@ class ChatterboxMultilingualTTS:
             speech_tokens = drop_invalid_tokens(speech_tokens)
             speech_tokens = speech_tokens.to(self.device)
 
+            # Use FP16 compiled copy for inference if available (copy 0 is FP32, for embed_ref only)
+            s3gen_infer = self.s3gen_copies[1] if len(self.s3gen_copies) > 1 else self.s3gen
             t_s3_start = time.perf_counter()
-            wav, _ = self.s3gen.inference(
+            wav, _ = s3gen_infer.inference(
                 speech_tokens=speech_tokens,
                 ref_dict=conds.gen,
             )
@@ -690,7 +692,6 @@ class ChatterboxMultilingualTTS:
             # S3Gen: Per-item sequential inference using FP16 copies
             # Tensor batching causes OOM due to O(T²) attention in UpsampleConformerEncoder.
             # Per-item reduces attention memory from B×8×T²×4B (~655 MiB) to 1×8×T²×2B (~41 MiB).
-            torch.cuda.empty_cache()
 
             # Use FP16 S3Gen copies (copy 0 = FP32, reserved for embed_ref)
             s3gen_workers = self.s3gen_copies[1:] if len(self.s3gen_copies) > 1 else [self.s3gen]
