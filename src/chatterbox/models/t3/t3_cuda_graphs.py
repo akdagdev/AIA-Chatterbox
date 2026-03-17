@@ -302,6 +302,61 @@ class T3BatchStepCUDAGraphWrapper:
             static_tensors["attention_mask"] = attention_mask.clone() if attention_mask is not None else None
             static_tensors["cache_position"] = cache_position.clone() if cache_position is not None else None
 
+            # Warmup: run 3 eager passes before graph capture to allow cuBLAS to
+            # auto-select kernels and allocate workspace for this batch size.
+            # Without warmup, cuBLAS tries to allocate inside torch.cuda.graph()
+            # which is forbidden, corrupting the capture-time output (all EOS).
+            # Save/restore the KV cache slot written during warmup so the capture
+            # sees the correct pre-warmup state.
+            if cache_position is not None:
+                warmup_cache_pos = int(cache_position.item())
+                kv_slot_saves = [
+                    (key[:, :, warmup_cache_pos, :].clone(),
+                     val[:, :, warmup_cache_pos, :].clone())
+                    for key, val in zip(self.kv_cache.key_cache, self.kv_cache.value_cache)
+                ]
+            else:
+                kv_slot_saves = None
+
+            with torch.inference_mode():
+                warmup_gen_ids = static_tensors["generated_ids"].clone()
+                for _ in range(3):
+                    self.generate_token_batch(
+                        static_tensors["speech_embedding_cache"],
+                        static_tensors["output_logits"].clone(),
+                        static_tensors["i_tensor"],
+                        static_tensors["batch_idx"],
+                        static_tensors["speech_pos_embedding_cache"],
+                        warmup_gen_ids,
+                        static_tensors["cfg_weight"],
+                        static_tensors["temperature"],
+                        self.repetition_penalty_processor,
+                        self.min_p_warper,
+                        self.top_p_warper,
+                        self.patched_model,
+                        self.kv_cache,
+                        self.input_batch_size,
+                        static_tensors["finished_mask"],
+                        self.stop_token_id,
+                        self.stop_token_tensor,
+                        static_tensors["max_position"],
+                        static_tensors["attention_mask"],
+                        static_tensors["cache_position"],
+                    )
+                    warmup_gen_ids.copy_(static_tensors["generated_ids"])
+            del warmup_gen_ids
+
+            # Restore the KV slot overwritten during warmup
+            if kv_slot_saves is not None:
+                for (key_s, val_s), key, val in zip(
+                    kv_slot_saves,
+                    self.kv_cache.key_cache,
+                    self.kv_cache.value_cache,
+                ):
+                    key[:, :, warmup_cache_pos, :].copy_(key_s)
+                    val[:, :, warmup_cache_pos, :].copy_(val_s)
+                del kv_slot_saves
+
             with torch.inference_mode():
                 with torch.cuda.graph(self._bucket_graphs[bucket_key]):
                     static_tensors["out_1"], static_tensors["out_2"] = self.generate_token_batch(
