@@ -26,7 +26,7 @@ from ..utils import AttrDict
 
 from .fast_min_p_warper import FastMinPLogitsWarper
 from .fast_top_p_warper import FastTopPLogitsWarper
-from .t3_cuda_graphs import T3StepCUDAGraphWrapper, get_next_bucket
+from .t3_cuda_graphs import T3StepCUDAGraphWrapper, T3BatchStepCUDAGraphWrapper, get_next_bucket
 
 logger = logging.getLogger(__name__)
 
@@ -760,11 +760,24 @@ class T3(nn.Module):
         # Pre-allocate stop_token_tensor for CUDA graph compatibility
         pre_stop_token_tensor = torch.tensor([[self.hp.stop_speech_token]], device=device, dtype=torch.long)
 
-        # Batch always uses eager — torch.compile fails with StaticCache weakref
-        # invalidation during AOT autograd functionalization (confirmed on torch 2.10).
-        # gen_max_position clips KV cache reads to actual generation range (up to 3×
-        # speedup vs the full 1500-bucket default: e.g., bucket 500 vs 1500).
-        generate_token_batch = generate_t3_token_batch
+        # Batch uses manual CUDA graphs (T3BatchStepCUDAGraphWrapper) to eliminate
+        # Python kernel-dispatch overhead (~8ms/step) that otherwise makes T3 batch
+        # throughput GPU-speed-independent.
+        # torch.compile fails with StaticCache weakref invalidation during AOT autograd
+        # functionalization (confirmed on torch 2.10) — manual CUDA graphs bypass this.
+        if not hasattr(self, "batch_cudagraph_wrapper"):
+            self.batch_cudagraph_wrapper = T3BatchStepCUDAGraphWrapper(
+                generate_t3_token_batch,
+                self.patched_model,
+                kv_cache,
+                self.repetition_penalty_processor,
+                self.min_p_warper,
+                self.top_p_warper,
+                input_batch_size=input_batch_size,
+                stop_token_id=self.hp.stop_speech_token,
+                stop_token_tensor=pre_stop_token_tensor,
+            )
+        generate_token_batch = self.batch_cudagraph_wrapper
 
         # Pre-allocate cache_position tensor — updated in-place each iteration
         cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
@@ -776,6 +789,10 @@ class T3(nn.Module):
             # Unmask new position in 4D mask (generated tokens are always real)
             if gen_attn_mask is not None:
                 gen_attn_mask[:, 0, 0, seq_len + i] = 0.0
+
+            # Advance CUDA RNG before each graph replay so torch.multinomial uses a
+            # different seed per step — without this every replay samples the same token.
+            torch.compiler.cudagraph_mark_step_begin()
 
             next_token, output_logits = generate_token_batch(
                 self._speech_embedding_cache,
