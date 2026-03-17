@@ -760,15 +760,12 @@ class T3(nn.Module):
         # Pre-allocate stop_token_tensor for CUDA graph compatibility
         pre_stop_token_tensor = torch.tensor([[self.hp.stop_speech_token]], device=device, dtype=torch.long)
 
-        # Manual CUDA graph capture (T3BatchStepCUDAGraphWrapper) produces corrupted output.
-        # Instead use torch.compile(mode="reduce-overhead") which internally uses CUDA graph
-        # trees — a more robust mechanism that handles dynamic state (finished_mask, etc).
+        # Batch always uses eager — manual CUDA graph capture corrupts output, and
+        # torch.compile fails with StaticCache weak reference invalidation during
+        # AOT autograd functionalization when patched_model is passed as argument.
         # gen_max_position clips KV cache reads to actual generation range (up to 3×
         # speedup vs the full 1500-bucket default: e.g., bucket 500 vs 1500).
-        if device.type == "cuda":
-            generate_token_batch = _generate_token_batch_variants["reduce-overhead"]
-        else:
-            generate_token_batch = generate_t3_token_batch
+        generate_token_batch = generate_t3_token_batch
 
         # Pre-allocate cache_position tensor — updated in-place each iteration
         cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
