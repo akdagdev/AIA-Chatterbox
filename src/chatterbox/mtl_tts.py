@@ -379,6 +379,14 @@ class ChatterboxMultilingualTTS:
 
         t0 = time.perf_counter()
         with torch.inference_mode():
+            _is_cuda = self.device == "cuda" or (hasattr(self.device, "type") and self.device == "cuda")
+            try:
+                _is_cuda = next(self.t3.patched_model.parameters()).is_cuda
+            except Exception:
+                pass
+
+            if _is_cuda:
+                torch.cuda.synchronize()
             t_t3_start = time.perf_counter()
             speech_tokens = self.t3.inference(
                 t3_cond=conds.t3,
@@ -392,6 +400,8 @@ class ChatterboxMultilingualTTS:
                 top_p=top_p,
                 **t3_params,
             )
+            if _is_cuda:
+                torch.cuda.synchronize()
             t_t3 = time.perf_counter() - t_t3_start
 
             # Extract only the conditional batch.
@@ -403,11 +413,15 @@ class ChatterboxMultilingualTTS:
 
             # Use FP16 compiled copy for inference if available (copy 0 is FP32, for embed_ref only)
             s3gen_infer = self.s3gen_copies[1] if len(self.s3gen_copies) > 1 else self.s3gen
+            if _is_cuda:
+                torch.cuda.synchronize()
             t_s3_start = time.perf_counter()
             wav, _ = s3gen_infer.inference(
                 speech_tokens=speech_tokens,
                 ref_dict=conds.gen,
             )
+            if _is_cuda:
+                torch.cuda.synchronize()
             t_s3 = time.perf_counter() - t_s3_start
 
             wav = wav.squeeze(0).detach().cpu().numpy()
