@@ -26,7 +26,7 @@ from ..utils import AttrDict
 
 from .fast_min_p_warper import FastMinPLogitsWarper
 from .fast_top_p_warper import FastTopPLogitsWarper
-from .t3_cuda_graphs import T3StepCUDAGraphWrapper, T3BatchStepCUDAGraphWrapper, PrefillCUDAGraphWrapper, get_next_bucket, FlexibleStaticCache
+from .t3_cuda_graphs import T3StepCUDAGraphWrapper, T3BatchStepCUDAGraphWrapper, T3MultiStepCUDAGraphWrapper, PrefillCUDAGraphWrapper, get_next_bucket, FlexibleStaticCache
 
 logger = logging.getLogger(__name__)
 
@@ -454,10 +454,15 @@ class T3(nn.Module):
         stride_length=4,
         skip_when_1=True,
         benchmark_t3=False,
+        profile_t3=False,
+        multi_step_n=1,
     ):
         """
         Args:
             text_tokens: a 1D (unbatched) or 2D (batched) tensor.
+            multi_step_n: Number of tokens per CUDA graph replay. >1 captures N
+                forward passes in a single graph, amortizing Python overhead by N.
+                Only effective with generate_token_backend="cudagraphs-manual".
         """
         # Validate / sanitize inputs
         assert prepend_prompt_speech_tokens is None, "not implemented"
@@ -604,11 +609,145 @@ class T3(nn.Module):
             _generate_token_variants["cudagraphs-manual"] = self.cudagraph_wrapper
 
         generate_token = _generate_token_variants.get(generate_token_backend, _generate_token_variants["eager"])
+
+        # --- Multi-step CUDA graph path (Phase 2) ---
+        # Captures N forward passes in a single graph, amortizing Python
+        # dispatch overhead by N. Falls through to single-step loop when
+        # multi_step_n=1 (default) or when not using CUDA graphs.
+        if multi_step_n > 1 and generate_token_backend == "cudagraphs-manual":
+            N = multi_step_n
+            if not hasattr(self, "_multistep_wrappers"):
+                self._multistep_wrappers = {}
+            if N not in self._multistep_wrappers:
+                self._multistep_wrappers[N] = T3MultiStepCUDAGraphWrapper(
+                    generate_t3_token_multistep,
+                    self.patched_model,
+                    kv_cache,
+                    self.repetition_penalty_processor,
+                    self.min_p_warper,
+                    self.top_p_warper,
+                    n_steps=N,
+                )
+            multistep_wrapper = self._multistep_wrappers[N]
+
+            cache_position_start = torch.tensor(seq_len, device=device, dtype=torch.long)
+            i = 0
+
+            if benchmark_t3:
+                start = time.time()
+                torch.cuda.synchronize()
+
+            if profile_t3 and device.type == "cuda":
+                _prof_events = []
+                _prof_alloc_start = torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
+
+            # Multi-step blocks
+            while i + N <= max_new_tokens:
+                if i > length_guesstimate:
+                    if (generated_ids == stop_token_tensor).any():
+                        if benchmark_t3:
+                            torch.cuda.synchronize()
+                            print(f"Stopping at {i} because EOS (multi-step)")
+                            print(f"Generated {i} tokens in {time.time() - start:.2f}s")
+                            print(f"{i / (time.time() - start):.2f} it/s")
+                        break
+
+                if profile_t3 and device.type == "cuda":
+                    _evt_start = torch.cuda.Event(enable_timing=True)
+                    _evt_end = torch.cuda.Event(enable_timing=True)
+                    _evt_start.record()
+
+                torch.compiler.cudagraph_mark_step_begin()
+                i_start = indices[i]
+                cache_position_start.fill_(seq_len + i)
+                max_position = get_next_bucket(i + N - 1 + seq_len, 250, TOKEN_LIMIT)
+
+                outputs = multistep_wrapper(
+                    self._speech_embedding_cache,
+                    output_logits,
+                    i_start,
+                    batch_idx,
+                    self._speech_pos_embedding_cache,
+                    generated_ids,
+                    cfg_weight,
+                    temperature,
+                    max_position,
+                    cache_position_start,
+                )
+                output_logits = outputs[1]
+                generated_ids = outputs[2]
+
+                if profile_t3 and device.type == "cuda":
+                    _evt_end.record()
+                    _prof_events.append((_evt_start, _evt_end))
+
+                i += N
+
+            # Tail: single-step for remaining tokens (at most N-1 steps)
+            for j in range(i, max_new_tokens):
+                if j > length_guesstimate and j % 20 == 0:
+                    if (generated_ids == stop_token_tensor).any():
+                        break
+                torch.compiler.cudagraph_mark_step_begin()
+                i_tensor = indices[j]
+                max_position = get_next_bucket(j + seq_len, 250, TOKEN_LIMIT)
+                outputs = generate_token(
+                    self._speech_embedding_cache,
+                    output_logits,
+                    i_tensor,
+                    batch_idx,
+                    self._speech_pos_embedding_cache,
+                    generated_ids,
+                    cfg_weight,
+                    temperature,
+                    self.repetition_penalty_processor,
+                    self.min_p_warper,
+                    self.top_p_warper,
+                    self.patched_model,
+                    kv_cache,
+                    1,
+                    max_position=max_position,
+                )
+                output_logits = outputs[1]
+                if len(outputs) == 3:
+                    generated_ids = outputs[2]
+
+            if benchmark_t3:
+                torch.cuda.synchronize()
+                total = max(i, 1)
+                print(f"Generated {total} tokens in {time.time() - start:.2f}s")
+                print(f"{total / (time.time() - start):.2f} it/s")
+
+            if profile_t3 and device.type == "cuda":
+                torch.cuda.synchronize()
+                _prof_alloc_end = torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
+                step_times = [s.elapsed_time(e) for s, e in _prof_events]
+                if step_times:
+                    step_times.sort()
+                    n = len(step_times)
+                    print(f"\n--- T3 Multi-Step Profile ({n} blocks × {N} steps) ---")
+                    print(f"  per-block: median={step_times[n//2]:.3f}ms  mean={sum(step_times)/n:.3f}ms  p95={step_times[int(n*0.95)]:.3f}ms")
+                    print(f"  per-token: median={step_times[n//2]/N:.3f}ms  mean={sum(step_times)/n/N:.3f}ms")
+                    print(f"  allocator retries: {_prof_alloc_end - _prof_alloc_start}")
+
+            return generated_ids
+
+        # --- Single-step loop (default path) ---
         if benchmark_t3:
             start = time.time()
             torch.cuda.synchronize() # For benchmarking to have correct it/s
         stride_length = stride_length if "stride" in generate_token_backend else 1
-        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True): 
+
+        # Phase 0: Profiling instrumentation (zero cost when profile_t3=False)
+        if profile_t3 and device.type == "cuda":
+            _prof_events = []
+            _prof_alloc_start = torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
+
+        loop_range = range(max_new_tokens // stride_length)
+        if benchmark_t3:
+            loop_range = tqdm(loop_range, desc="Sampling", dynamic_ncols=True)
+
+        for i in loop_range:
             i_tensor = indices[i * stride_length]
             # Check for EOS token.
             if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
@@ -621,7 +760,11 @@ class T3(nn.Module):
                         print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
                     break
 
-            # print(kv_cache.get_seq_length().unsqueeze(0))
+            if profile_t3 and device.type == "cuda":
+                _evt_start = torch.cuda.Event(enable_timing=True)
+                _evt_end = torch.cuda.Event(enable_timing=True)
+                _evt_start.record()
+
             torch.compiler.cudagraph_mark_step_begin()
             bucket_size = 250
             max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
@@ -643,10 +786,17 @@ class T3(nn.Module):
                 max_position=max_position,
                 alignment_stream_analyzer=self.patched_model.alignment_stream_analyzer,
             )
+            # Direct references to static tensors — no .clone() needed.
+            # For CUDA graphs: wrapper's static tensors are updated in-place
+            # by graph replay; output_logits is copied into the input buffer
+            # before the next replay. For eager: each call returns new tensors.
             output_logits = outputs[1]
             if len(outputs) == 3:
-                generated_ids = outputs[2].clone()
-            output_logits = output_logits.clone()
+                generated_ids = outputs[2]
+
+            if profile_t3 and device.type == "cuda":
+                _evt_end.record()
+                _prof_events.append((_evt_start, _evt_end))
 
             if i == max_new_tokens // stride_length - 1:
                 if benchmark_t3:
@@ -654,6 +804,17 @@ class T3(nn.Module):
                     print(f"Stopping at {(i + 1) * stride_length} because max_new_tokens reached")
                     print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
                     print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
+
+        if profile_t3 and device.type == "cuda":
+            torch.cuda.synchronize()
+            _prof_alloc_end = torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
+            step_times = [s.elapsed_time(e) for s, e in _prof_events]
+            if step_times:
+                step_times.sort()
+                n = len(step_times)
+                print(f"\n--- T3 Profile ({n} steps) ---")
+                print(f"  per-step: median={step_times[n//2]:.3f}ms  mean={sum(step_times)/n:.3f}ms  p95={step_times[int(n*0.95)]:.3f}ms")
+                print(f"  allocator retries: {_prof_alloc_end - _prof_alloc_start}")
 
         return generated_ids
 
@@ -848,7 +1009,7 @@ class T3(nn.Module):
         # Pre-allocate cache_position tensor — updated in-place each iteration
         cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
 
-        for i in tqdm(range(max_new_tokens), desc="Batch Sampling", dynamic_ncols=True):
+        for i in range(max_new_tokens):
             i_tensor = indices[i]
             cache_pos.fill_(seq_len + i)
 
@@ -882,7 +1043,9 @@ class T3(nn.Module):
                 attention_mask=gen_attn_mask,
                 cache_position=cache_pos,
             )
-            output_logits = output_logits.clone()
+            # Direct reference to static tensor — no .clone() needed.
+            # output_logits is copied into the input buffer by the wrapper
+            # before the next graph replay.
 
             # Immediate EOS detection via latest token.
             # drop_invalid_tokens truncates at first EOS regardless — delaying
@@ -992,6 +1155,80 @@ def generate_t3_token(
     )
 
 
+def generate_t3_token_multistep(
+    _speech_embedding_cache: Tensor,
+    output_logits: Tensor,
+    i_start_tensor: Tensor,
+    batch_idx: Tensor,
+    position_embeds: Tensor,
+    generated_ids: Tensor,
+    cfg_weight: float,
+    temperature: float,
+    repetition_penalty_processor: RepetitionPenaltyLogitsProcessor,
+    min_p_warper: MinPLogitsWarper,
+    top_p_warper: TopPLogitsWarper,
+    patched_model: T3HuggingfaceBackend,
+    kv_cache: StaticCache,
+    max_position: Optional[int] = None,
+    cache_position_start: Optional[Tensor] = None,
+    n_steps: int = 10,
+):
+    """
+    Execute N token generation steps in sequence. All ops are CUDA-graph
+    capturable — no Python control flow on GPU values, no GPU→CPU transfers.
+
+    When captured as a CUDA graph, one graph.replay() executes N forward
+    passes, amortizing Python dispatch overhead by N.
+
+    Args:
+        i_start_tensor: Scalar tensor — index into generated_ids for sub-step 0.
+        cache_position_start: Scalar tensor — KV cache write position for sub-step 0.
+            Incremented by sub_step internally. Must be passed explicitly because
+            get_seq_length() may return stale values after graph capture corruption.
+        n_steps: Number of forward passes to execute.
+    """
+    for sub_step in range(n_steps):
+        i_tensor = i_start_tensor + sub_step
+
+        logits = output_logits[:, -1, :]
+
+        # CFG
+        if cfg_weight > 0.0:
+            logits_cond = logits[0:1]
+            logits_uncond = logits[1:2]
+            logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
+
+        logits = logits.squeeze(1)
+        logits = repetition_penalty_processor(generated_ids, logits)
+
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        logits = min_p_warper(None, logits)
+        logits = top_p_warper(None, logits)
+
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+
+        generated_ids.index_put_((batch_idx, i_tensor), next_token.squeeze(-1))
+
+        position_embed = torch.index_select(position_embeds, 0, i_tensor).squeeze(0)
+        next_token_embed = _speech_embedding_cache[next_token] + position_embed
+
+        if cfg_weight > 0.0:
+            next_token_embed = torch.cat([next_token_embed, next_token_embed])
+
+        cache_pos = (cache_position_start + sub_step).unsqueeze(0)
+        output_logits = patched_model(
+            inputs_embeds=next_token_embed,
+            past_key_values=kv_cache,
+            cache_position=cache_pos,
+            max_position=max_position,
+        )
+
+    return next_token, output_logits
+
+
 def generate_t3_tokens_strided(
     _speech_embedding_cache: Tensor,
     output_logits: Tensor,
@@ -1029,7 +1266,6 @@ def generate_t3_tokens_strided(
             # max_position=max_position, # only use for cudagraphs-manual
             alignment_stream_analyzer=alignment_stream_analyzer
         )
-        output_logits = output_logits.clone()
     return next_token, output_logits
     
 
