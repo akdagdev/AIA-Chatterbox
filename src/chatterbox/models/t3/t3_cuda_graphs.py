@@ -841,17 +841,29 @@ class T3BatchStepCUDAGraphWrapper:
             return (real_out_1, real_out_2)
         else:
             static_tensors = self._bucket_static_tensors[bucket_key]
-            # Only copy tensors that change and aren't shared:
-            # - output_logits: previous output → current input buffer
-            # - i_tensor: step counter
-            # - finished_mask: EOS tracking (new tensor each step from | op)
-            # generated_ids, attention_mask, cache_position are shared (not
-            # cloned at capture) — main loop updates them in-place.
             static_tensors["output_logits"].copy_(output_logits)
             static_tensors["i_tensor"].copy_(i_tensor)
             static_tensors["finished_mask"].copy_(finished_mask)
 
+            # Cross-call fix: inference_batch() creates new tensors each call.
+            # The graph writes to addresses captured on the first call.  When
+            # addresses differ, copy data in before replay and out after.
+            _gen_shared = generated_ids.data_ptr() == static_tensors["generated_ids"].data_ptr()
+            if not _gen_shared:
+                static_tensors["generated_ids"].copy_(generated_ids)
+                if attention_mask is not None and static_tensors.get("attention_mask") is not None:
+                    static_tensors["attention_mask"].copy_(attention_mask)
+                if cache_position is not None and static_tensors.get("cache_position") is not None:
+                    static_tensors["cache_position"].copy_(cache_position)
+
             self._bucket_graphs[bucket_key].replay()
+
+            if not _gen_shared:
+                generated_ids.copy_(static_tensors["generated_ids"])
+                if attention_mask is not None and static_tensors.get("attention_mask") is not None:
+                    attention_mask.copy_(static_tensors["attention_mask"])
+                if cache_position is not None and static_tensors.get("cache_position") is not None:
+                    cache_position.copy_(static_tensors["cache_position"])
 
         static_tensors = self._bucket_static_tensors[bucket_key]
         return (
