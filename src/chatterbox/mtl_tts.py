@@ -205,16 +205,17 @@ class ChatterboxMultilingualTTS:
         t3.to(device).eval()
 
         # T3 mixed-precision: only the Llama backbone (95% of weights, bandwidth
-        # bottleneck) runs in FP16. Embeddings, conditioning, position embeddings,
-        # and the speech_head projection stay FP32 to avoid cumulative precision loss
-        # that causes muffled audio and generation bleed.
+        # bottleneck) runs in BF16. BF16 has the same dynamic range as FP32
+        # (8 exponent bits) so attention scores and RMSNorm don't overflow/underflow
+        # like FP16. Embeddings, conditioning, position embeddings, and the
+        # speech_head projection stay FP32 for logit precision.
         # Skip on GPUs beyond PyTorch's supported compute capability (e.g. GB10 cc 12.1
         # with PyTorch max 12.0) — fallback kernels cause 6× regression.
         if str(device).startswith("cuda"):
             cc_major, _ = torch.cuda.get_device_capability(device)
             if cc_major < 12:
-                t3.tfmr.half()  # Llama backbone only
-                _log.info("T3 Llama backbone running in FP16 (cc %d.x)", cc_major)
+                t3.tfmr.to(torch.bfloat16)  # Llama backbone only
+                _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
             else:
                 _log.info("T3 staying FP32 — compute capability %d.x exceeds PyTorch support", cc_major)
 
