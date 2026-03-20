@@ -270,12 +270,16 @@ class T3StepCUDAGraphWrapper:
             # - output_logits: previous step's output fed back as input
             # Constant tensors (speech_embedding_cache, batch_idx,
             # speech_pos_embedding_cache) were cloned at capture time.
-            # generated_ids is shared (not cloned at capture) — graph writes
-            # to it in-place via index_put_, no copy needed.
             static_tensors = self._bucket_static_tensors[bucket_key]
 
             static_tensors["i_tensor"].copy_(i_tensor)
             static_tensors["output_logits"].copy_(output_logits)
+
+            # Sync generated_ids if the caller's tensor is at a different address
+            # (new inference() call allocates fresh generated_ids). Without this,
+            # previous generation's tokens leak via repetition_penalty.
+            if generated_ids.data_ptr() != static_tensors["generated_ids"].data_ptr():
+                static_tensors["generated_ids"].copy_(generated_ids)
 
             # Replay the graph for this bucket
             self._bucket_graphs[bucket_key].replay()
@@ -460,6 +464,14 @@ class T3MultiStepCUDAGraphWrapper:
         static_tensors["i_start_tensor"].copy_(i_start_tensor)
         static_tensors["output_logits"].copy_(output_logits)
         static_tensors["cache_position_start"].copy_(cache_position_start)
+
+        # Sync generated_ids: each inference() call creates a fresh tensor at a
+        # potentially different address. The graph writes to the static tensor's
+        # address via index_put_, so we must copy the caller's (PAD-initialized)
+        # data in before replay. Without this, previous generation's tokens leak
+        # into repetition_penalty, causing audio bleed between generations.
+        if generated_ids.data_ptr() != static_tensors["generated_ids"].data_ptr():
+            static_tensors["generated_ids"].copy_(generated_ids)
 
         self._bucket_graphs[bucket_key].replay()
 
