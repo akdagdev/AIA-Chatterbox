@@ -93,6 +93,7 @@ def main():
                 language_id=lang,
                 conditionals=conds,
                 max_new_tokens=1000,
+                t3_params={"profile_t3": True},
             )
         if device == "cuda":
             torch.cuda.synchronize()
@@ -118,6 +119,7 @@ def main():
                 language_id=None,
                 max_new_tokens=400,
                 cfg_weight=0.5,
+                t3_params={"profile_t3": True},
             )
         if device == "cuda":
             torch.cuda.synchronize()

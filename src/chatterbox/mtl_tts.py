@@ -452,6 +452,7 @@ class ChatterboxMultilingualTTS:
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
+        t3_params={},
     ):
         """
         Batch TTS generation for multiple texts simultaneously.
@@ -482,6 +483,7 @@ class ChatterboxMultilingualTTS:
                 repetition_penalty=repetition_penalty,
                 min_p=min_p,
                 top_p=top_p,
+                t3_params=t3_params,
             )
         finally:
             self._batch_lock.release()
@@ -499,6 +501,7 @@ class ChatterboxMultilingualTTS:
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
+        t3_params={},
     ):
         batch_size = len(texts)
         if batch_size == 0:
@@ -708,6 +711,7 @@ class ChatterboxMultilingualTTS:
                 repetition_penalty=repetition_penalty,
                 min_p=min_p,
                 top_p=top_p,
+                **t3_params,
             )
             t_t3 = time.perf_counter() - t_t3_start
 

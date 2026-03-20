@@ -594,8 +594,6 @@ class T3(nn.Module):
 
         indices = torch.arange(1, max_new_tokens + 1, device=generated_ids.device)
         batch_idx = torch.zeros(1, dtype=torch.long, device=generated_ids.device)
-        # Pre-allocate cache_position to avoid GPU→CPU sync from get_seq_length() each step
-        cache_position = torch.tensor([seq_len], device=device, dtype=torch.long)
         if generate_token_backend == "cudagraphs-manual":
             if not hasattr(self, "cudagraph_wrapper"):
                 self.cudagraph_wrapper = T3StepCUDAGraphWrapper(
@@ -692,7 +690,6 @@ class T3(nn.Module):
                         break
                 torch.compiler.cudagraph_mark_step_begin()
                 i_tensor = indices[j]
-                cache_position.fill_(seq_len + j)
                 max_position = get_next_bucket(j + seq_len, 250, TOKEN_LIMIT)
                 outputs = generate_token(
                     self._speech_embedding_cache,
@@ -710,7 +707,6 @@ class T3(nn.Module):
                     kv_cache,
                     1,
                     max_position=max_position,
-                    cache_position=cache_position,
                 )
                 output_logits = outputs[1]
                 if len(outputs) == 3:
@@ -770,7 +766,6 @@ class T3(nn.Module):
                 _evt_start.record()
 
             torch.compiler.cudagraph_mark_step_begin()
-            cache_position.fill_(seq_len + i * stride_length)
             bucket_size = 250
             max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
             outputs = generate_token(
@@ -790,7 +785,6 @@ class T3(nn.Module):
                 stride_length,
                 max_position=max_position,
                 alignment_stream_analyzer=self.patched_model.alignment_stream_analyzer,
-                cache_position=cache_position,
             )
             # Direct references to static tensors — no .clone() needed.
             # For CUDA graphs: wrapper's static tensors are updated in-place
@@ -840,6 +834,7 @@ class T3(nn.Module):
         repetition_penalty=1.2,
         cfg_weight=0.5,
         max_cache_len=1500,
+        profile_t3=False,
     ):
         """
         Batch inference for multiple texts simultaneously.
@@ -1015,6 +1010,10 @@ class T3(nn.Module):
         # Pre-allocate cache_position tensor — updated in-place each iteration
         cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
 
+        if profile_t3 and device.type == "cuda":
+            _prof_events = []
+            _prof_alloc_start = torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
+
         for i in range(max_new_tokens):
             i_tensor = indices[i]
             cache_pos.fill_(seq_len + i)
@@ -1022,6 +1021,11 @@ class T3(nn.Module):
             # Unmask new position in 4D mask (generated tokens are always real)
             if gen_attn_mask is not None:
                 gen_attn_mask[:, 0, 0, seq_len + i] = 0.0
+
+            if profile_t3 and device.type == "cuda":
+                _evt_start = torch.cuda.Event(enable_timing=True)
+                _evt_end = torch.cuda.Event(enable_timing=True)
+                _evt_start.record()
 
             # Advance CUDA RNG before each graph replay so torch.multinomial uses a
             # different seed per step — without this every replay samples the same token.
@@ -1049,6 +1053,11 @@ class T3(nn.Module):
                 attention_mask=gen_attn_mask,
                 cache_position=cache_pos,
             )
+
+            if profile_t3 and device.type == "cuda":
+                _evt_end.record()
+                _prof_events.append((_evt_start, _evt_end))
+
             # Direct reference to static tensor — no .clone() needed.
             # output_logits is copied into the input buffer by the wrapper
             # before the next graph replay.
@@ -1062,6 +1071,19 @@ class T3(nn.Module):
             # keeps the GPU stalled on Python overhead regardless of GPU speed.
             if i % 5 == 4 and finished_mask.all():
                 break
+
+        if profile_t3 and device.type == "cuda":
+            torch.cuda.synchronize()
+            _prof_alloc_end = torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
+            step_times = [s.elapsed_time(e) for s, e in _prof_events]
+            if step_times:
+                step_times.sort()
+                n = len(step_times)
+                print(f"\n--- T3 Batch Profile ({n} steps, batch={input_batch_size}) ---")
+                print(f"  per-step: median={step_times[n//2]:.3f}ms  mean={sum(step_times)/n:.3f}ms  p95={step_times[int(n*0.95)]:.3f}ms")
+                print(f"  total: {sum(step_times):.1f}ms  ({sum(step_times)/1000:.2f}s)")
+                print(f"  throughput: {n*1000/sum(step_times):.1f} steps/s")
+                print(f"  allocator retries: {_prof_alloc_end - _prof_alloc_start}")
 
         return generated_ids
 
@@ -1106,8 +1128,7 @@ def generate_t3_token(
     kv_cache: StaticCache,
     stride_length: int = 0, # for API simplicity
     max_position: Optional[int] = None,
-    alignment_stream_analyzer: Optional[AlignmentStreamAnalyzer] = None,
-    cache_position: Optional[Tensor] = None,
+    alignment_stream_analyzer: Optional[AlignmentStreamAnalyzer] = None
 ):
     logits = output_logits[:, -1, :]
 
@@ -1152,13 +1173,10 @@ def generate_t3_token(
     if cfg_weight > 0.0:
         next_token_embed = torch.cat([next_token_embed, next_token_embed])
 
-    if cache_position is None:
-        cache_position = kv_cache.get_seq_length().unsqueeze(0)
-
     return next_token, patched_model(
         inputs_embeds=next_token_embed,
         past_key_values=kv_cache,
-        cache_position=cache_position,
+        cache_position=kv_cache.get_seq_length().unsqueeze(0),
         max_position=max_position,
     )
 

@@ -168,7 +168,6 @@ class T3StepCUDAGraphWrapper:
         temperature: float,
         stride_length: int,
         max_position: Optional[int] = None,
-        cache_position: Optional[torch.Tensor] = None,
     ) -> None:
         """Capture the CUDA graph for a specific bucket."""
         print(
@@ -198,10 +197,6 @@ class T3StepCUDAGraphWrapper:
             static_tensors["temperature"] = temperature
             static_tensors["stride_length"] = stride_length
             static_tensors["max_position"] = bucket_key
-            if cache_position is not None:
-                static_tensors["cache_position"] = cache_position.clone()
-            else:
-                static_tensors["cache_position"] = None
 
             # Capture the graph
             with torch.inference_mode():
@@ -223,7 +218,6 @@ class T3StepCUDAGraphWrapper:
                         static_tensors["stride_length"],
                         static_tensors["max_position"],
                         self.alignment_stream_analyzer,
-                        static_tensors["cache_position"],
                     )
 
             # Store static tensors for this bucket
@@ -251,7 +245,6 @@ class T3StepCUDAGraphWrapper:
         stride_length: int = 1,
         max_position: Optional[int] = None,
         alignment_stream_analyzer: Any = None,
-        cache_position: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Determine which bucket to use
         bucket_key = max_position or TOKEN_LIMIT
@@ -270,13 +263,11 @@ class T3StepCUDAGraphWrapper:
                 temperature,
                 stride_length,
                 max_position,
-                cache_position,
             )
         else:
             # Only copy tensors that change between steps:
             # - i_tensor: increments each step
             # - output_logits: previous step's output fed back as input
-            # - cache_position: increments each step (avoids GPU→CPU sync)
             # Constant tensors (speech_embedding_cache, batch_idx,
             # speech_pos_embedding_cache) were cloned at capture time.
             # generated_ids is shared (not cloned at capture) — graph writes
@@ -285,8 +276,6 @@ class T3StepCUDAGraphWrapper:
 
             static_tensors["i_tensor"].copy_(i_tensor)
             static_tensors["output_logits"].copy_(output_logits)
-            if cache_position is not None and static_tensors["cache_position"] is not None:
-                static_tensors["cache_position"].copy_(cache_position)
 
             # Replay the graph for this bucket
             self._bucket_graphs[bucket_key].replay()
