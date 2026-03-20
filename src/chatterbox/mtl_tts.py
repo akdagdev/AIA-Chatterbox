@@ -203,7 +203,19 @@ class ChatterboxMultilingualTTS:
             t3_state = t3_state["model"][0]
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
-        
+
+        # T3 in FP16: halves memory-bandwidth per token (weight read 2.1 GB → 1.05 GB).
+        # LLM token generation is memory-bandwidth-bound, so FP16 ≈ 2× speedup.
+        # Skip on GPUs beyond PyTorch's supported compute capability (e.g. GB10 cc 12.1
+        # with PyTorch max 12.0) — fallback kernels cause 6× regression.
+        if str(device).startswith("cuda"):
+            cc_major, _ = torch.cuda.get_device_capability(device)
+            if cc_major < 12:
+                t3.half()
+                _log.info("T3 running in FP16 (cc %d.x)", cc_major)
+            else:
+                _log.info("T3 staying FP32 — compute capability %d.x exceeds PyTorch support", cc_major)
+
         # Note: torch.compile on the module only wraps forward() (training path).
         # Inference uses inference()/inference_batch() which bypass compiled forward.
         # Single-mode compilation is handled by standalone _generate_token_variants.
