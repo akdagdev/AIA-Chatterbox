@@ -10,7 +10,7 @@ All audio concatenated with 0.3s silence gaps → test_mixed_output.wav
 
 import time
 import torch
-import torchaudio
+import soundfile as sf
 from pathlib import Path
 
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SpeechRequest, Conditionals
@@ -52,7 +52,7 @@ ALL_TEXTS = [(t, "en") for t in TEXTS_EN] + [(t, "tr") for t in TEXTS_TR]
 def save_audio(tensor: torch.Tensor, path: str, sr: int = 24000):
     if tensor.ndim == 1:
         tensor = tensor.unsqueeze(0)
-    torchaudio.save(path, tensor.detach().cpu(), sr)
+    sf.write(path, tensor.detach().cpu().numpy().T, sr)
 
 
 def make_silence(sr: int, duration: float = 0.3) -> torch.Tensor:

@@ -85,97 +85,40 @@ class ConditionalCFM(BASECFM):
             cond: Not used but kept for future purposes
         """
         t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
-        # t is scalar.
-
-        # Batch size
         b = x.size(0)
 
-        # I am storing this because I can later plot it by putting a debugger here and saving it to a file
-        # Or in future might add like a return_all_steps flag
-        sol = []
-
-        # Prepare CFG batch (2 * B)
-        # Structure: [Conditional, Unconditional]
-        # x: Repeated
-        # mask: Repeated
-        # mu: [mu, zeros]
-        # t: Repeated
-        # spks: [spks, zeros?] -> Usually we drop spk cond for CFG too? 
-        #   Original code: spks_in[0] = spks. spks_in initialized to zeros. So yes, uncond has zero spks.
-        # cond: [cond, zeros]
-
-        # Allocate buffers
-        # We can construct them directly rather than init zeros and assign.
-        
-        # x_in: repeat x twice
-        x_in = torch.cat([x, x], dim=0)
-        
-        # mask_in: repeat mask twice
+        # Pre-allocate CFG buffers once — only x_in and t_in change per step.
+        # mask, mu, spks, cond are constant across all Euler steps.
+        x_in = torch.empty(2 * b, *x.shape[1:], dtype=x.dtype, device=x.device)
         mask_in = torch.cat([mask, mask], dim=0)
-        
-        # mu_in: [mu, zeros]
-        mu_uncond = torch.zeros_like(mu)
-        mu_in = torch.cat([mu, mu_uncond], dim=0)
-        
-        # t_in: [t, t] (expanded to batch)
-        # t is scalar. We need [2*B]
-        t_batch = t.expand(b)
-        t_in = torch.cat([t_batch, t_batch], dim=0)
-        
-        # spks_in
-        spks_uncond = torch.zeros_like(spks)
-        spks_in = torch.cat([spks, spks_uncond], dim=0)
-        
-        # cond_in
-        cond_uncond = torch.zeros_like(cond)
-        cond_in = torch.cat([cond, cond_uncond], dim=0)
+        mu_in = torch.cat([mu, torch.zeros_like(mu)], dim=0)
+        t_in = torch.empty(2 * b, dtype=t.dtype, device=t.device)
+        spks_in = torch.cat([spks, torch.zeros_like(spks)], dim=0)
+        cond_in = torch.cat([cond, torch.zeros_like(cond)], dim=0)
+
+        cfg_scale_cond = 1.0 + self.inference_cfg_rate
+        cfg_scale_uncond = self.inference_cfg_rate
 
         for step in range(1, len(t_span)):
-            # Classifier-Free Guidance inference introduced in VoiceBox
-            # Update inputs changing over time
-            
-            # Update x (current state)
-            x_in = torch.cat([x, x], dim=0)
-            
-            # Update t
-            t_curr = t.expand(b)
-            t_in = torch.cat([t_curr, t_curr], dim=0)
-            
-            # mask, mu, spks, cond stay constant usually, but let's keep consistent with original loop if they modify in place?
-            # Original code modified buffers in place. 
-            # We can just reuse our constructed buffers if they don't change.
-            # Only x and t change. 
-            
+            # Update x and t in pre-allocated buffers (no allocation)
+            x_in[:b] = x
+            x_in[b:] = x
+            t_in[:b] = t
+            t_in[b:] = t
+
             dphi_dt = self.forward_estimator(
-                x_in, mask_in,
-                mu_in, t_in,
-                spks_in,
-                cond_in
+                x_in, mask_in, mu_in, t_in, spks_in, cond_in
             )
-            
-            # Split
+
             dphi_dt_cond, dphi_dt_uncond = torch.chunk(dphi_dt, 2, dim=0)
-            
-            # CFG Formula
-            # rate * cond + (1 - rate) * uncond? 
-            # Original: (1.0 + rate) * dphi - rate * cfg_dphi
-            # dphi is conditional (index 0). cfg_dphi is unconditional (index 1).
-            # Wait, original code:
-            # dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-            # x.size(0) was 1 (in original context). 
-            # So index 0 (cond), index 1 (uncond).
-            # Formula: (1 + cfg) * cond - cfg * uncond
-            # = cond + cfg * (cond - uncond). Yes, standard CFG.
-            
-            dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt_cond - self.inference_cfg_rate * dphi_dt_uncond)
-            
+            dphi_dt = cfg_scale_cond * dphi_dt_cond - cfg_scale_uncond * dphi_dt_uncond
+
             x = x + dt * dphi_dt
             t = t + dt
-            sol.append(x)
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
 
-        return sol[-1].float()
+        return x.float()
 
     def forward_estimator(self, x, mask, mu, t, spks, cond):
         if isinstance(self.estimator, torch.nn.Module):

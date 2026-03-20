@@ -329,12 +329,13 @@ class ChatterboxMultilingualTTS:
         cfg_weight=0.5,
         temperature=0.8,
         # cache optimization params
-        max_new_tokens=1000, 
+        max_new_tokens=1000,
         max_cache_len=1500, # Affects the T3 speed, hence important
         # t3 sampling params
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
+        multi_step_n=4,
         t3_params={},
     ):
         # Validate language_id
@@ -398,6 +399,7 @@ class ChatterboxMultilingualTTS:
                 repetition_penalty=repetition_penalty,
                 min_p=min_p,
                 top_p=top_p,
+                multi_step_n=multi_step_n,
                 **t3_params,
             )
             if _is_cuda:
@@ -764,13 +766,17 @@ class ChatterboxMultilingualTTS:
                                 speech_tokens=tokens,
                                 ref_dict=item_ref_dicts[idx],
                             )
-                        stream.synchronize()
+                            raw_wavs[idx] = wav.squeeze(0)[: len(tokens) * 2 * 480]
                     else:
                         wav, _ = worker.inference(
                             speech_tokens=tokens,
                             ref_dict=item_ref_dicts[idx],
                         )
-                    raw_wavs[idx] = wav.squeeze(0)[: len(tokens) * 2 * 480]
+                        raw_wavs[idx] = wav.squeeze(0)[: len(tokens) * 2 * 480]
+                # Sync once at end of worker — all items are GPU tensors,
+                # no CPU access needed until results assembly.
+                if stream is not None:
+                    stream.synchronize()
 
             t_s3_start = time.perf_counter()
             with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:

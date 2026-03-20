@@ -315,7 +315,7 @@ class LlamaAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters.get("rope_theta", 10000.0) if hasattr(config, "rope_parameters") and config.rope_parameters else getattr(config, "rope_theta", 10000.0)
         self.is_causal = True
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
