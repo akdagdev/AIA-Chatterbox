@@ -1158,7 +1158,9 @@ def generate_t3_token(
     logits = top_p_warper(None, logits)
 
     # Convert logits to probabilities and sample the next token.
-    probs = torch.softmax(logits, dim=-1)
+    # Upcast to FP32 for softmax precision — FP16 logits cause muffled audio
+    # due to probability distribution distortion in the speech token vocabulary.
+    probs = torch.softmax(logits.float(), dim=-1)
     next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
 
     # generated_ids[0, i + bos_len] = next_token.clone()
@@ -1233,7 +1235,7 @@ def generate_t3_token_multistep(
         logits = min_p_warper(None, logits)
         logits = top_p_warper(None, logits)
 
-        probs = torch.softmax(logits, dim=-1)
+        probs = torch.softmax(logits.float(), dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
 
         generated_ids.index_put_((batch_idx, i_tensor), next_token.squeeze(-1))
@@ -1358,7 +1360,8 @@ def generate_t3_token_batch(
     logits = top_p_warper(None, logits)
 
     # Sample next token for each batch item
-    probs = torch.softmax(logits, dim=-1)
+    # Upcast to FP32 for softmax precision — FP16 logits cause muffled audio
+    probs = torch.softmax(logits.float(), dim=-1)
     next_token = torch.multinomial(probs, num_samples=1)  # shape: (input_batch_size, 1)
 
     # Force finished items to generate stop_token (prevents hallucination)
