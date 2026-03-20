@@ -212,22 +212,31 @@ class ChatterboxMultilingualTTS:
         # Skip on GPUs beyond PyTorch's supported compute capability (e.g. GB10 cc 12.1
         # with PyTorch max 12.0) — fallback kernels cause 6× regression.
         #
-        # Optional INT8 weight-only quantization (set T3_QUANTIZE=int8 env var):
-        # Stores Llama weights as INT8, dequantizes to BF16 on-the-fly during matmul.
-        # Halves bandwidth again (4× total vs FP32). Requires torchao package.
-        # Quality impact needs per-GPU testing.
+        # Optional weight quantization (set T3_QUANTIZE env var):
+        #   T3_QUANTIZE=int8 — INT8 weight-only (2× bandwidth reduction vs BF16)
+        #   T3_QUANTIZE=int4 — INT4 weight-only (4× vs BF16, quality risk)
+        # Stores Llama weights quantized, dequantizes to BF16 on-the-fly during matmul.
+        # Requires torchao package. Quality impact needs per-GPU testing.
         if str(device).startswith("cuda"):
             cc_major, _ = torch.cuda.get_device_capability(device)
             if cc_major < 12:
                 t3.tfmr.to(torch.bfloat16)  # Llama backbone only
                 quant_mode = os.environ.get("T3_QUANTIZE", "").lower()
-                if quant_mode == "int8":
+                if quant_mode in ("int8", "int4"):
                     try:
-                        from torchao.quantization import Int8WeightOnlyConfig, quantize_
-                        quantize_(t3.tfmr, Int8WeightOnlyConfig())
-                        _log.info("T3 Llama backbone running in INT8 weight-only + BF16 compute (cc %d.x)", cc_major)
+                        from torchao.quantization import (
+                            Int4WeightOnlyConfig,
+                            Int8WeightOnlyConfig,
+                            quantize_,
+                        )
+                        config = Int8WeightOnlyConfig() if quant_mode == "int8" else Int4WeightOnlyConfig()
+                        quantize_(t3.tfmr, config)
+                        _log.info("T3 Llama backbone: %s weight-only + BF16 compute (cc %d.x)", quant_mode.upper(), cc_major)
                     except ImportError:
-                        _log.warning("T3_QUANTIZE=int8 requested but torchao not installed, staying BF16")
+                        _log.warning("T3_QUANTIZE=%s requested but torchao not installed, staying BF16", quant_mode)
+                        _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
+                    except Exception as e:
+                        _log.warning("T3_QUANTIZE=%s failed: %s — staying BF16", quant_mode, e)
                         _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
                 else:
                     _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
