@@ -204,15 +204,17 @@ class ChatterboxMultilingualTTS:
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
 
-        # T3 in FP16: halves memory-bandwidth per token (weight read 2.1 GB → 1.05 GB).
-        # LLM token generation is memory-bandwidth-bound, so FP16 ≈ 2× speedup.
+        # T3 mixed-precision: only the Llama backbone (95% of weights, bandwidth
+        # bottleneck) runs in FP16. Embeddings, conditioning, position embeddings,
+        # and the speech_head projection stay FP32 to avoid cumulative precision loss
+        # that causes muffled audio and generation bleed.
         # Skip on GPUs beyond PyTorch's supported compute capability (e.g. GB10 cc 12.1
         # with PyTorch max 12.0) — fallback kernels cause 6× regression.
         if str(device).startswith("cuda"):
             cc_major, _ = torch.cuda.get_device_capability(device)
             if cc_major < 12:
-                t3.half()
-                _log.info("T3 running in FP16 (cc %d.x)", cc_major)
+                t3.tfmr.half()  # Llama backbone only
+                _log.info("T3 Llama backbone running in FP16 (cc %d.x)", cc_major)
             else:
                 _log.info("T3 staying FP32 — compute capability %d.x exceeds PyTorch support", cc_major)
 

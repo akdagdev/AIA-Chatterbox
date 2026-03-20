@@ -90,8 +90,11 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         """
         # Handle input validation before calling the model
 
+        # Cast inputs to Llama's dtype (FP16 when backbone is half-precision)
+        # while keeping speech_head in FP32 for logit precision.
+        model_dtype = next(self.model.parameters()).dtype
         tfmr_out = self.model(
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds.to(model_dtype),
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -104,7 +107,8 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         # Top-level sompilation may require .clone() here
         hidden_states = tfmr_out[0]
 
-        logits = self.speech_head(hidden_states)
+        # Upcast hidden_states to FP32 for speech_head projection precision
+        logits = self.speech_head(hidden_states.float())
         # assert inputs_embeds.size(0) == 1 # (disabled for CFG)
 
         # NOTE: hallucination handler may modify logits to force emit an EOS token
