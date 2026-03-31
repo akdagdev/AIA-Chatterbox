@@ -264,6 +264,16 @@ class T3(nn.Module):
                 # alignment_stream_analyzer=alignment_stream_analyzer,
             )
 
+            # Replace LlamaMLP with fused Triton kernel version.
+            # Fuses gate_proj + up_proj into single matmul, SiLU + mul into
+            # one Triton kernel. Reduces per-layer kernel count from ~6 to ~3.
+            import os
+            if self.device.type == "cuda" and os.environ.get("T3_NO_FUSED_MLP") != "1":
+                from .inference.custom_llama.fused_mlp import replace_mlp_with_fused
+                n_fused = replace_mlp_with_fused(patched_model.model)
+                if n_fused > 0:
+                    logger.info("T3: replaced %d MLP blocks with fused Triton kernels", n_fused)
+
             self.patched_model = patched_model
             self.compiled = True
 
@@ -450,8 +460,7 @@ class T3(nn.Module):
         # optimizations
         max_cache_len=1500,
         initial_forward_pass_backend="eager",
-        generate_token_backend="inductor",
-        # generate_token_backend="cudagraphs-manual",
+        generate_token_backend="cudagraphs-manual",
         stride_length=4,
         skip_when_1=True,
         benchmark_t3=False,
