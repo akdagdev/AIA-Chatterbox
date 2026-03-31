@@ -264,15 +264,17 @@ class T3(nn.Module):
                 # alignment_stream_analyzer=alignment_stream_analyzer,
             )
 
-            # Replace LlamaMLP with fused Triton kernel version.
-            # Fuses gate_proj + up_proj into single matmul, SiLU + mul into
-            # one Triton kernel. Reduces per-layer kernel count from ~6 to ~3.
+            # Replace decoder layer components with fused Triton kernel versions:
+            # - RMSNorm: 5 eager kernels → 1 Triton kernel (×2 per layer + 1 final)
+            # - QKV projection: 3 matmuls → 1 fused matmul
+            # - MLP gate+up: 2 matmuls → 1 fused matmul + SiLU*mul in 1 Triton kernel
+            # Reduces per-layer kernel count from ~34 to ~17 (30 layers: ~1020 → ~510).
             import os
-            if self.device.type == "cuda" and os.environ.get("T3_NO_FUSED_MLP") != "1":
-                from .inference.custom_llama.fused_mlp import replace_mlp_with_fused
-                n_fused = replace_mlp_with_fused(patched_model.model)
-                if n_fused > 0:
-                    logger.info("T3: replaced %d MLP blocks with fused Triton kernels", n_fused)
+            if self.device.type == "cuda" and os.environ.get("T3_NO_FUSED") != "1":
+                from .inference.custom_llama.fused_mlp import fuse_decoder_layers
+                counts = fuse_decoder_layers(patched_model.model)
+                if any(counts.values()):
+                    logger.info("T3 fused: %d MLP, %d RMSNorm, %d QKV", counts["mlp"], counts["rmsnorm"], counts["qkv"])
 
             self.patched_model = patched_model
             self.compiled = True
