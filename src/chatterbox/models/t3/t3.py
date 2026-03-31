@@ -26,7 +26,7 @@ from ..utils import AttrDict
 
 from .fast_min_p_warper import FastMinPLogitsWarper
 from .fast_top_p_warper import FastTopPLogitsWarper
-from .t3_cuda_graphs import T3StepCUDAGraphWrapper, T3BatchStepCUDAGraphWrapper, T3MultiStepCUDAGraphWrapper, PrefillCUDAGraphWrapper, get_next_bucket, FlexibleStaticCache
+from .t3_cuda_graphs import T3StepCUDAGraphWrapper, T3BatchStepCUDAGraphWrapper, T3MultiStepCUDAGraphWrapper, T3BatchMultiStepCUDAGraphWrapper, PrefillCUDAGraphWrapper, get_next_bucket, FlexibleStaticCache
 
 logger = logging.getLogger(__name__)
 
@@ -998,16 +998,16 @@ class T3(nn.Module):
         # Pre-allocate stop_token_tensor for CUDA graph compatibility
         pre_stop_token_tensor = torch.tensor([[self.hp.stop_speech_token]], device=device, dtype=torch.long)
 
-        # Batch uses manual CUDA graphs (T3BatchStepCUDAGraphWrapper) to eliminate
-        # Python kernel-dispatch overhead (~8ms/step) that otherwise makes T3 batch
-        # throughput GPU-speed-independent.
-        # torch.compile fails with StaticCache weakref invalidation during AOT autograd
-        # functionalization (confirmed on torch 2.10) — manual CUDA graphs bypass this.
-        if not hasattr(self, "_batch_cudagraph_wrappers"):
-            self._batch_cudagraph_wrappers = {}
-        if input_batch_size not in self._batch_cudagraph_wrappers:
-            self._batch_cudagraph_wrappers[input_batch_size] = T3BatchStepCUDAGraphWrapper(
-                generate_t3_token_batch,
+        # Batch multi-step CUDA graphs: N forward passes per graph replay.
+        # Amortizes Python dispatch overhead by N while maintaining batch
+        # awareness (finished_mask, 4D attention_mask, per-item EOS tracking).
+        BATCH_N_STEPS = 4
+        if not hasattr(self, "_batch_multistep_wrappers"):
+            self._batch_multistep_wrappers = {}
+        wrapper_key = (input_batch_size, BATCH_N_STEPS)
+        if wrapper_key not in self._batch_multistep_wrappers:
+            self._batch_multistep_wrappers[wrapper_key] = T3BatchMultiStepCUDAGraphWrapper(
+                generate_t3_token_batch_multistep,
                 self.patched_model,
                 kv_cache,
                 self.repetition_penalty_processor,
@@ -1016,37 +1016,32 @@ class T3(nn.Module):
                 input_batch_size=input_batch_size,
                 stop_token_id=self.hp.stop_speech_token,
                 stop_token_tensor=pre_stop_token_tensor,
+                n_steps=BATCH_N_STEPS,
             )
-        generate_token_batch = self._batch_cudagraph_wrappers[input_batch_size]
+        multistep_batch = self._batch_multistep_wrappers[wrapper_key]
 
-        # Pre-allocate cache_position tensor — updated in-place each iteration
-        cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
+        cache_pos_start = torch.tensor(seq_len, device=device, dtype=torch.long)
 
         if profile_t3 and device.type == "cuda":
             _prof_events = []
             _prof_alloc_start = torch.cuda.memory_stats(device).get("num_alloc_retries", 0)
 
-        for i in range(max_new_tokens):
-            i_tensor = indices[i]
-            cache_pos.fill_(seq_len + i)
-
-            # Unmask new position in 4D mask (generated tokens are always real)
-            if gen_attn_mask is not None:
-                gen_attn_mask[:, 0, 0, seq_len + i] = 0.0
-
+        N = BATCH_N_STEPS
+        i = 0
+        while i + N <= max_new_tokens:
             if profile_t3 and device.type == "cuda":
                 _evt_start = torch.cuda.Event(enable_timing=True)
                 _evt_end = torch.cuda.Event(enable_timing=True)
                 _evt_start.record()
 
-            # Advance CUDA RNG before each graph replay so torch.multinomial uses a
-            # different seed per step — without this every replay samples the same token.
             torch.compiler.cudagraph_mark_step_begin()
+            i_start = indices[i]
+            cache_pos_start.fill_(seq_len + i)
 
-            next_token, output_logits = generate_token_batch(
+            next_token, output_logits, finished_mask = multistep_batch(
                 self._speech_embedding_cache,
                 output_logits,
-                i_tensor,
+                i_start,
                 batch_idx,
                 self._speech_pos_embedding_cache,
                 generated_ids,
@@ -1059,30 +1054,56 @@ class T3(nn.Module):
                 kv_cache,
                 input_batch_size,
                 finished_mask,
-                stop_token_id=self.hp.stop_speech_token,
-                stop_token_tensor=pre_stop_token_tensor,
-                max_position=gen_max_position,
-                attention_mask=gen_attn_mask,
-                cache_position=cache_pos,
+                self.hp.stop_speech_token,
+                pre_stop_token_tensor,
+                gen_max_position,
+                gen_attn_mask,
+                cache_pos_start,
             )
 
             if profile_t3 and device.type == "cuda":
                 _evt_end.record()
                 _prof_events.append((_evt_start, _evt_end))
 
-            # Direct reference to static tensor — no .clone() needed.
-            # output_logits is copied into the input buffer by the wrapper
-            # before the next graph replay.
+            i += N
 
-            # Immediate EOS detection via latest token.
-            # drop_invalid_tokens truncates at first EOS regardless — delaying
-            # detection only wastes loop iterations without affecting audio quality.
-            newly_eos = (next_token.squeeze(1) == self.hp.stop_speech_token)
-            finished_mask = finished_mask | newly_eos
-            # Check every 5 steps — .all() forces GPU-CPU sync, checking every step
-            # keeps the GPU stalled on Python overhead regardless of GPU speed.
-            if i % 5 == 4 and finished_mask.all():
+            # Check EOS every N steps (amortized GPU-CPU sync)
+            if finished_mask.all():
                 break
+
+        # Tail: single-step for remaining tokens (at most N-1 steps)
+        if not finished_mask.all():
+            # Fallback to single-step wrapper for tail
+            if not hasattr(self, "_batch_cudagraph_wrappers"):
+                self._batch_cudagraph_wrappers = {}
+            if input_batch_size not in self._batch_cudagraph_wrappers:
+                self._batch_cudagraph_wrappers[input_batch_size] = T3BatchStepCUDAGraphWrapper(
+                    generate_t3_token_batch,
+                    self.patched_model, kv_cache,
+                    self.repetition_penalty_processor, self.min_p_warper, self.top_p_warper,
+                    input_batch_size=input_batch_size,
+                    stop_token_id=self.hp.stop_speech_token,
+                    stop_token_tensor=pre_stop_token_tensor,
+                )
+            tail_wrapper = self._batch_cudagraph_wrappers[input_batch_size]
+            cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
+            for j in range(i, max_new_tokens):
+                cache_pos.fill_(seq_len + j)
+                if gen_attn_mask is not None:
+                    gen_attn_mask[:, 0, 0, seq_len + j] = 0.0
+                torch.compiler.cudagraph_mark_step_begin()
+                next_token, output_logits = tail_wrapper(
+                    self._speech_embedding_cache, output_logits, indices[j], batch_idx,
+                    self._speech_pos_embedding_cache, generated_ids, cfg_weight, temperature,
+                    self.repetition_penalty_processor, self.min_p_warper, self.top_p_warper,
+                    self.patched_model, kv_cache, input_batch_size, finished_mask,
+                    self.hp.stop_speech_token, pre_stop_token_tensor, gen_max_position,
+                    gen_attn_mask, cache_pos,
+                )
+                newly_eos = (next_token.squeeze(1) == self.hp.stop_speech_token)
+                finished_mask = finished_mask | newly_eos
+                if finished_mask.all():
+                    break
 
         if profile_t3 and device.type == "cuda":
             torch.cuda.synchronize()
@@ -1412,4 +1433,85 @@ _generate_token_batch_variants = {
     "eager": generate_t3_token_batch,
     "reduce-overhead": torch.compile(generate_t3_token_batch, mode="reduce-overhead"),
 }
+
+
+def generate_t3_token_batch_multistep(
+    _speech_embedding_cache: Tensor,
+    output_logits: Tensor,
+    i_start_tensor: Tensor,
+    batch_idx: Tensor,
+    position_embeds: Tensor,
+    generated_ids: Tensor,
+    cfg_weight: float,
+    temperature: float,
+    repetition_penalty_processor: RepetitionPenaltyLogitsProcessor,
+    min_p_warper: MinPLogitsWarper,
+    top_p_warper: TopPLogitsWarper,
+    patched_model: T3HuggingfaceBackend,
+    kv_cache: StaticCache,
+    input_batch_size: int,
+    finished_mask: Tensor,
+    stop_token_id: int,
+    stop_token_tensor: Tensor,
+    max_position: Optional[int] = None,
+    attention_mask: Optional[Tensor] = None,
+    cache_position_start: Optional[Tensor] = None,
+    n_steps: int = 4,
+):
+    """
+    Batch multi-step: N forward passes in one CUDA graph replay.
+    Combines T3BatchStep (batch awareness, finished_mask, attention_mask)
+    with MultiStep (N iterations, explicit cache_position).
+    """
+    for sub_step in range(n_steps):
+        i_tensor = i_start_tensor + sub_step
+
+        # Unmask new position in 4D attention mask
+        if attention_mask is not None:
+            cache_pos_val = cache_position_start + sub_step
+            # attention_mask is [B, 1, 1, max_pos] — unmask the new position
+            attention_mask[:, 0, 0, cache_pos_val] = 0.0
+
+        logits = output_logits[:, -1, :]
+
+        if cfg_weight > 0.0:
+            logits_cond, logits_uncond = torch.chunk(logits, 2, dim=0)
+            logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
+
+        logits = repetition_penalty_processor(generated_ids, logits)
+
+        if temperature != 1.0:
+            logits = logits / temperature
+
+        logits = min_p_warper(None, logits)
+        logits = top_p_warper(None, logits)
+
+        probs = torch.softmax(logits.float(), dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+
+        if finished_mask is not None and stop_token_tensor is not None:
+            next_token = torch.where(finished_mask.unsqueeze(1), stop_token_tensor, next_token)
+
+        i_expanded = i_tensor.expand(input_batch_size)
+        generated_ids.scatter_(1, i_expanded.unsqueeze(1), next_token)
+
+        newly_eos = (next_token.squeeze(1) == stop_token_id)
+        finished_mask = finished_mask | newly_eos
+
+        position_embed = torch.index_select(position_embeds, 0, i_tensor).squeeze(0)
+        next_token_embed = _speech_embedding_cache[next_token] + position_embed
+
+        if cfg_weight > 0.0:
+            next_token_embed = torch.cat([next_token_embed, next_token_embed], dim=0)
+
+        cache_pos = (cache_position_start + sub_step).unsqueeze(0)
+        output_logits = patched_model(
+            inputs_embeds=next_token_embed,
+            past_key_values=kv_cache,
+            cache_position=cache_pos,
+            max_position=max_position,
+            attention_mask=attention_mask,
+        )
+
+    return next_token, output_logits, finished_mask
 

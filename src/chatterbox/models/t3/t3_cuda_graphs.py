@@ -897,3 +897,144 @@ class T3BatchStepCUDAGraphWrapper:
 
     def mark_new_generation(self):
         self.kv_cache.reset()
+
+
+class T3BatchMultiStepCUDAGraphWrapper:
+    """
+    CUDA Graph wrapper: N batch forward passes in one graph replay.
+    Combines batch awareness (finished_mask, 4D attention_mask) with
+    multi-step (N iterations, explicit cache_position, amortized dispatch).
+    """
+
+    def __init__(self, generate_fn, patched_model, kv_cache,
+                 repetition_penalty_processor, min_p_warper, top_p_warper,
+                 input_batch_size, stop_token_id, stop_token_tensor, n_steps=4):
+        self.generate_fn = generate_fn
+        self.patched_model = patched_model
+        self.kv_cache = kv_cache
+        self.repetition_penalty_processor = repetition_penalty_processor
+        self.min_p_warper = min_p_warper
+        self.top_p_warper = top_p_warper
+        self.input_batch_size = input_batch_size
+        self.stop_token_id = stop_token_id
+        self.stop_token_tensor = stop_token_tensor
+        self.n_steps = n_steps
+        self._bucket_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
+        self._bucket_static_tensors: Dict[int, dict] = {}
+        self._captured_buckets = set()
+        self.dtype = patched_model.dtype
+
+    def _call_fn(self, st, gen_ids, finished, output_logits_in=None):
+        return self.generate_fn(
+            st["speech_embedding_cache"],
+            output_logits_in if output_logits_in is not None else st["output_logits"],
+            st["i_start_tensor"], st["batch_idx"], st["speech_pos_embedding_cache"],
+            gen_ids, st["cfg_weight"], st["temperature"],
+            self.repetition_penalty_processor, self.min_p_warper, self.top_p_warper,
+            self.patched_model, self.kv_cache, self.input_batch_size,
+            finished, self.stop_token_id, self.stop_token_tensor,
+            st["max_position"], st["attention_mask"], st["cache_position_start"],
+            self.n_steps,
+        )
+
+    def _capture_graph_for_bucket(self, bucket_key, speech_embedding_cache,
+            output_logits, i_start_tensor, batch_idx, speech_pos_embedding_cache,
+            generated_ids, cfg_weight, temperature, finished_mask,
+            max_position, attention_mask, cache_position_start):
+        print(f"Capturing batch multi-step CUDA graph bucket {bucket_key} (N={self.n_steps})")
+        lock = CUDA_CAPTURE_LOCK
+        if lock:
+            lock.acquire()
+        try:
+            self._bucket_graphs[bucket_key] = torch.cuda.CUDAGraph()
+            st = {
+                "speech_embedding_cache": speech_embedding_cache.clone(),
+                "output_logits": output_logits.clone(),
+                "i_start_tensor": i_start_tensor.clone(),
+                "batch_idx": batch_idx.clone(),
+                "speech_pos_embedding_cache": speech_pos_embedding_cache.clone(),
+                "generated_ids": generated_ids,
+                "cfg_weight": cfg_weight, "temperature": temperature,
+                "finished_mask": finished_mask.clone(),
+                "max_position": bucket_key,
+                "attention_mask": attention_mask,
+                "cache_position_start": cache_position_start,
+            }
+            # Save KV slots
+            if cache_position_start is not None:
+                wp = int(cache_position_start.item())
+                n = self.n_steps
+                kv_saves = [(l.keys[:,:,wp:wp+n,:].clone(), l.values[:,:,wp:wp+n,:].clone())
+                            for l in self.kv_cache.layers if l.is_initialized]
+            else:
+                kv_saves = None
+            # 3 warmup passes
+            with torch.inference_mode():
+                wg = st["generated_ids"].clone()
+                for _ in range(3):
+                    self._call_fn(st, wg, st["finished_mask"].clone())
+                    wg.copy_(st["generated_ids"])
+                del wg
+            # Restore KV
+            if kv_saves is not None:
+                for (ks, vs), l in zip(kv_saves, [l for l in self.kv_cache.layers if l.is_initialized]):
+                    l.keys[:,:,wp:wp+n,:].copy_(ks); l.values[:,:,wp:wp+n,:].copy_(vs)
+                del kv_saves
+            # Capture
+            with torch.inference_mode():
+                with torch.cuda.graph(self._bucket_graphs[bucket_key]):
+                    st["out_1"], st["out_2"], st["out_finished"] = self._call_fn(
+                        st, st["generated_ids"], st["finished_mask"])
+            self._bucket_static_tensors[bucket_key] = st
+            self._captured_buckets.add(bucket_key)
+            torch.cuda.synchronize()
+        finally:
+            if lock:
+                lock.release()
+
+    def __call__(self, speech_embedding_cache, output_logits, i_start_tensor,
+            batch_idx, speech_pos_embedding_cache, generated_ids, cfg_weight,
+            temperature, repetition_penalty_processor, min_p_warper, top_p_warper,
+            patched_model, kv_cache, input_batch_size, finished_mask,
+            stop_token_id, stop_token_tensor, max_position, attention_mask,
+            cache_position_start):
+        bucket_key = max_position or TOKEN_LIMIT
+        if bucket_key not in self._captured_buckets:
+            orig_gen = generated_ids.clone()
+            orig_fin = finished_mask.clone()
+            self._capture_graph_for_bucket(
+                bucket_key, speech_embedding_cache, output_logits, i_start_tensor,
+                batch_idx, speech_pos_embedding_cache, generated_ids, cfg_weight,
+                temperature, finished_mask, max_position, attention_mask,
+                cache_position_start)
+            st = self._bucket_static_tensors[bucket_key]
+            with torch.inference_mode():
+                r1, r2, rf = self._call_fn(st, orig_gen, orig_fin, output_logits)
+            generated_ids.copy_(orig_gen)
+            return r1, r2, rf
+        else:
+            st = self._bucket_static_tensors[bucket_key]
+            st["output_logits"].copy_(output_logits)
+            st["i_start_tensor"].copy_(i_start_tensor)
+            st["finished_mask"].copy_(finished_mask)
+            shared = generated_ids.data_ptr() == st["generated_ids"].data_ptr()
+            if not shared:
+                st["generated_ids"].copy_(generated_ids)
+                if attention_mask is not None and st.get("attention_mask") is not None:
+                    st["attention_mask"].copy_(attention_mask)
+            self._bucket_graphs[bucket_key].replay()
+            if not shared:
+                generated_ids.copy_(st["generated_ids"])
+                if attention_mask is not None and st.get("attention_mask") is not None:
+                    attention_mask.copy_(st["attention_mask"])
+            return st["out_1"], st["out_2"], st["out_finished"]
+
+    def reset(self, bucket_key=None):
+        if bucket_key:
+            self._bucket_graphs.pop(bucket_key, None)
+            self._bucket_static_tensors.pop(bucket_key, None)
+            self._captured_buckets.discard(bucket_key)
+        else:
+            self._bucket_graphs.clear()
+            self._bucket_static_tensors.clear()
+            self._captured_buckets.clear()
