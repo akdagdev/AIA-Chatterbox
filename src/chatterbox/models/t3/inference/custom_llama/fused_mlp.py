@@ -86,25 +86,28 @@ class FusedLlamaMLP(nn.Module):
         # Single matmul for both gate and up: [batch, seq, hidden] → [batch, seq, 2*intermediate]
         gate_up = self.gate_up_proj(x)
 
-        # Split into gate and up halves
-        gate = gate_up[..., :self.intermediate_size]
-        up = gate_up[..., self.intermediate_size:]
+        # Split and write SiLU(gate)*up into the first half in-place.
+        # gate_up is contiguous from matmul output. The two halves are views
+        # into the same storage (contiguous along last dim), so we can use the
+        # gate half's memory as the output buffer — no allocation needed.
+        # This makes it safe inside CUDA graph capture.
+        gate = gate_up[..., :self.intermediate_size].contiguous()
+        up = gate_up[..., self.intermediate_size:].contiguous()
 
         if HAS_TRITON and gate.is_cuda and gate.dtype == torch.bfloat16:
-            # Fused SiLU(gate) * up kernel
-            intermediate = torch.empty_like(gate)
-            N = gate.numel()
+            gate_flat = gate.view(-1)
+            up_flat = up.view(-1)
+            N = gate_flat.numel()
             BLOCK = 1024
             grid = ((N + BLOCK - 1) // BLOCK,)
+            # Write result into gate_flat in-place (reuse gate memory as output)
             _silu_mul_kernel[grid](
-                gate.contiguous().data_ptr(),
-                up.contiguous().data_ptr(),
-                intermediate.data_ptr(),
+                gate_flat, up_flat, gate_flat,
                 N,
                 BLOCK=BLOCK,
             )
+            intermediate = gate
         else:
-            # Fallback for non-CUDA or non-BF16
             intermediate = torch.nn.functional.silu(gate) * up
 
         return self.down_proj(intermediate)
