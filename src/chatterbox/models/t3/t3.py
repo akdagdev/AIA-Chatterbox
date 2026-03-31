@@ -264,32 +264,6 @@ class T3(nn.Module):
                 # alignment_stream_analyzer=alignment_stream_analyzer,
             )
 
-            # Compile individual Llama submodules with inductor for kernel fusion.
-            # Only compile components that DON'T interact with the KV cache:
-            # - MLP blocks (gate_proj + up_proj + SiLU + down_proj → fused into 1-2 kernels)
-            # - RMSNorm layers (fused with surrounding ops)
-            # This avoids torch.compile conflicts with StaticCache mutations
-            # (index_copy_) and CUDA graph capture, while still reducing the
-            # GPU kernel count that bottlenecks both B200 and RTX4090.
-            # fullgraph=True works because these are pure functions with no
-            # control flow, cache ops, or dynamic shapes.
-            import os
-            if self.device.type == "cuda" and os.environ.get("T3_NO_COMPILE") != "1":
-                n_compiled = 0
-                for layer in patched_model.model.layers:
-                    try:
-                        # dynamic=True: use symbolic shapes so inductor compiles once
-                        # and reuses for any input size. Prevents lazy recompilation
-                        # during CUDA graph capture (which crashes because inductor's
-                        # benchmarking calls torch.cuda.synchronize()).
-                        layer.mlp = torch.compile(layer.mlp, fullgraph=True, dynamic=True)
-                        n_compiled += 1
-                    except Exception as e:
-                        logger.warning("torch.compile MLP failed at layer %d: %s", n_compiled, e)
-                        break
-                if n_compiled > 0:
-                    logger.info("T3: compiled %d MLP blocks with inductor", n_compiled)
-
             self.patched_model = patched_model
             self.compiled = True
 
@@ -476,8 +450,8 @@ class T3(nn.Module):
         # optimizations
         max_cache_len=1500,
         initial_forward_pass_backend="eager",
-        generate_token_backend="cudagraphs-manual",
-        # generate_token_backend="eager",
+        generate_token_backend="inductor",
+        # generate_token_backend="cudagraphs-manual",
         stride_length=4,
         skip_when_1=True,
         benchmark_t3=False,
