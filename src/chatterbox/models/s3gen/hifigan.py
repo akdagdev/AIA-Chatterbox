@@ -203,11 +203,6 @@ class SineGen(torch.nn.Module):
         :param f0: [B, 1, sample_len], Hz
         :return: [B, 1, sample_len]
         """
-        # Force FP32 for phase accumulation. cumsum in FP16 causes phase drift
-        # over long sequences (~0.001 rad/step → ~0.5 rad at 500 steps), producing
-        # distorted/muffled sine waves that degrade the excitation signal.
-        orig_dtype = f0.dtype
-        f0 = f0.float()
 
         F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1))).to(f0.device)
         for i in range(self.harmonic_num + 1):
@@ -233,7 +228,7 @@ class SineGen(torch.nn.Module):
         # first: set the unvoiced part to 0 by uv
         # then: additive noise
         sine_waves = sine_waves * uv + noise
-        return sine_waves.to(orig_dtype), uv.to(orig_dtype), noise.to(orig_dtype)
+        return sine_waves, uv, noise
 
 
 class SourceModuleHnNSF(torch.nn.Module):
