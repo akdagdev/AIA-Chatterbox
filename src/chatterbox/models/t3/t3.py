@@ -274,7 +274,7 @@ class T3(nn.Module):
                 from .inference.custom_llama.fused_mlp import fuse_decoder_layers
                 counts = fuse_decoder_layers(patched_model.model)
                 if any(counts.values()):
-                    logger.info("T3 fused: %d MLP, %d RMSNorm, %d QKV", counts["mlp"], counts["rmsnorm"], counts["qkv"])
+                    logger.info("T3 fused: %d MLP, %d RMSNorm, %d QKV, %d RoPE", counts["mlp"], counts["rmsnorm"], counts["qkv"], counts["rope"])
 
             self.patched_model = patched_model
             self.compiled = True
