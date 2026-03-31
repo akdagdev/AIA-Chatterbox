@@ -275,6 +275,14 @@ class T3(nn.Module):
             # control flow, cache ops, or dynamic shapes.
             import os
             if self.device.type == "cuda" and os.environ.get("T3_NO_COMPILE") != "1":
+                # Disable inductor benchmarking that runs GPU ops (synchronize,
+                # kernel timing) during compilation. Without this, lazy recompilation
+                # for a new input shape inside CUDA graph capture crashes because
+                # GPU synchronization is forbidden during stream capture.
+                import torch._inductor.config as _ind_cfg
+                _ind_cfg.pad_mm = False
+                _ind_cfg.benchmark_kernel = False
+
                 n_compiled = 0
                 for layer in patched_model.model.layers:
                     try:
