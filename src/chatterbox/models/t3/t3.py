@@ -276,10 +276,10 @@ class T3(nn.Module):
                 try:
                     patched_model.model = torch.compile(
                         patched_model.model,
-                        mode="max-autotune",
+                        mode="max-autotune-no-cudagraphs",
                         fullgraph=False,
                     )
-                    logger.info("T3 Llama backbone compiled with inductor (max-autotune)")
+                    logger.info("T3 Llama backbone compiled with inductor (max-autotune-no-cudagraphs)")
                 except Exception as e:
                     logger.warning("torch.compile failed: %s — using eager mode", e)
 
