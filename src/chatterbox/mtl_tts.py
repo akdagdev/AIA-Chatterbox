@@ -283,10 +283,12 @@ class ChatterboxMultilingualTTS:
         if (builtin_voice := ckpt_dir / "conds.pt").exists():
             conds = Conditionals.load(builtin_voice).to(device)
 
-        # Pre-warm T3 prefill CUDA graphs for all bucket sizes so that the first
-        # real inference call never triggers a slow capture mid-conversation.
+        # Pre-warm T3: first trigger torch.compile compilation for all input shapes,
+        # then capture CUDA graphs. Order matters — compilation during CUDA graph
+        # capture context crashes (inductor's constant folding runs GPU ops).
         if str(device).startswith("cuda"):
             t3.init_patched_model()
+            t3.warmup_compiled_model()
             t3.warmup_prefill_graphs()
 
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds, s3gen_copies=s3gen_copies)

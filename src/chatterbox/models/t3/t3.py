@@ -271,6 +271,8 @@ class T3(nn.Module):
             # RTX4090 at the same ~235 tok/s ceiling.
             # The compiled model is then captured inside manual CUDA graphs — graph
             # replay executes the fused (faster) kernels instead of the eager ones.
+            # Uses max-autotune-no-cudagraphs: kernel autotuning + fusion without
+            # internal CUDA graphs (our manual wrappers handle graph capture/replay).
             import os
             if self.device.type == "cuda" and os.environ.get("T3_NO_COMPILE") != "1":
                 try:
@@ -285,6 +287,88 @@ class T3(nn.Module):
 
             self.patched_model = patched_model
             self.compiled = True
+
+    def warmup_compiled_model(self, max_cache_len: int = 1500):
+        """Trigger torch.compile compilation for all input shapes BEFORE CUDA graph capture.
+
+        torch.compile is lazy — it compiles on first call per input shape. If the first
+        call happens inside torch.cuda.graph() capture context, inductor's constant folding
+        runs GPU ops (torch.full, .item()) which are forbidden during capture → crash.
+
+        This method runs dummy forward passes with both prefill and generation shapes to
+        force compilation while the stream is NOT capturing. Must be called before
+        warmup_prefill_graphs() or any CUDA graph capture.
+        """
+        if self.device.type != "cuda" or not self.compiled:
+            return
+        device = self.patched_model.device
+        dtype = self.patched_model.dtype
+        hidden = self.patched_model.config.hidden_size
+
+        # Temporary cache for warmup only
+        cache = StaticCache(
+            config=self.patched_model.config,
+            max_batch_size=2,
+            max_cache_len=max_cache_len,
+            device=device,
+            dtype=dtype,
+        )
+
+        with torch.inference_mode():
+            # Warmup 1: Prefill shape (triggers compilation for seq_len > 1)
+            for bucket in [64, 128, 256, 512]:
+                cache.reset()
+                dummy_prefill = torch.zeros(2, bucket, hidden, dtype=dtype, device=device)
+                cache_pos = torch.arange(bucket, device=device)
+                self.patched_model(
+                    inputs_embeds=dummy_prefill,
+                    past_key_values=cache,
+                    cache_position=cache_pos,
+                )
+
+            # Warmup 2: Generation shape (triggers compilation for seq_len = 1)
+            # This is the shape used in the token generation loop (single-step & multi-step).
+            cache.reset()
+            # First do a small prefill to fill some KV cache
+            dummy_prefill = torch.zeros(2, 64, hidden, dtype=dtype, device=device)
+            cache_pos = torch.arange(64, device=device)
+            self.patched_model(
+                inputs_embeds=dummy_prefill,
+                past_key_values=cache,
+                cache_position=cache_pos,
+            )
+            # Then the generation-time shape
+            dummy_gen = torch.zeros(2, 1, hidden, dtype=dtype, device=device)
+            gen_cache_pos = torch.tensor([64], device=device)
+            self.patched_model(
+                inputs_embeds=dummy_gen,
+                past_key_values=cache,
+                cache_position=gen_cache_pos,
+            )
+            # Also warmup with 4D attention mask (used in batch path)
+            cache.reset()
+            dummy_prefill = torch.zeros(2, 64, hidden, dtype=dtype, device=device)
+            cache_pos = torch.arange(64, device=device)
+            self.patched_model(
+                inputs_embeds=dummy_prefill,
+                past_key_values=cache,
+                cache_position=cache_pos,
+            )
+            min_val = torch.finfo(dtype).min
+            attn_mask_4d = torch.zeros(2, 1, 1, 250, dtype=dtype, device=device)
+            attn_mask_4d[:, 0, 0, 64:] = min_val
+            gen_cache_pos = torch.tensor([64], device=device)
+            dummy_gen = torch.zeros(2, 1, hidden, dtype=dtype, device=device)
+            self.patched_model(
+                inputs_embeds=dummy_gen,
+                past_key_values=cache,
+                cache_position=gen_cache_pos,
+                attention_mask=attn_mask_4d,
+            )
+
+        del cache
+        torch.cuda.empty_cache()
+        logger.info("torch.compile warmup complete (prefill + generation shapes)")
 
     def warmup_prefill_graphs(self, max_cache_len: int = 1500):
         """Pre-capture all PrefillCUDAGraphWrapper buckets at model-load time.
