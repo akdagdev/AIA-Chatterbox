@@ -1038,6 +1038,12 @@ class T3(nn.Module):
             i_start = indices[i]
             cache_pos_start.fill_(seq_len + i)
 
+            # Unmask N positions in 4D attention mask BEFORE graph replay
+            # (dynamic tensor indexing is forbidden inside CUDA graph capture)
+            if gen_attn_mask is not None:
+                for s in range(N):
+                    gen_attn_mask[:, 0, 0, seq_len + i + s] = 0.0
+
             next_token, output_logits, finished_mask = multistep_batch(
                 self._speech_embedding_cache,
                 output_logits,
@@ -1465,12 +1471,6 @@ def generate_t3_token_batch_multistep(
     """
     for sub_step in range(n_steps):
         i_tensor = i_start_tensor + sub_step
-
-        # Unmask new position in 4D attention mask
-        if attention_mask is not None:
-            cache_pos_val = cache_position_start + sub_step
-            # attention_mask is [B, 1, 1, max_pos] — unmask the new position
-            attention_mask[:, 0, 0, cache_pos_val] = 0.0
 
         logits = output_logits[:, -1, :]
 
