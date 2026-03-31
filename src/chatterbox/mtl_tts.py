@@ -262,12 +262,13 @@ class ChatterboxMultilingualTTS:
             if i > 0:  # Only non-primary copies use FP16
                 s3gen_copy.half()
                 if str(device).startswith("cuda"):
-                    # max-autotune-no-cudagraphs: aggressive kernel fusion (LayerNorm+GEGLU,
-                    # Conv1d+GroupNorm+Mish, attention QKV) without internal CUDA graphs.
-                    # No internal CUDA graphs = thread-safe, respects torch.cuda.stream()
-                    # context from worker threads for true GPU parallelism across copies.
-                    s3gen_copy.flow = torch.compile(s3gen_copy.flow, mode="max-autotune-no-cudagraphs")
-                    s3gen_copy.mel2wav = torch.compile(s3gen_copy.mel2wav, mode="max-autotune-no-cudagraphs")
+                    # "default" mode (not "reduce-overhead"): no internal CUDA graph trees →
+                    # thread-safe, respects torch.cuda.stream() context from worker threads →
+                    # enables true GPU parallelism across 3 copies on separate streams.
+                    # "reduce-overhead" binds graphs to the capture stream (default) and
+                    # silently serializes all thread calls there regardless of stream context.
+                    s3gen_copy.flow = torch.compile(s3gen_copy.flow, mode="default")
+                    s3gen_copy.mel2wav = torch.compile(s3gen_copy.mel2wav, mode="default")
             s3gen_copy.eval()
             s3gen_copies.append(s3gen_copy)
         
