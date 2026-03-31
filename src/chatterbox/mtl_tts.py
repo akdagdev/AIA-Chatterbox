@@ -229,15 +229,17 @@ class ChatterboxMultilingualTTS:
                             Int8WeightOnlyConfig,
                             quantize_,
                         )
-                        config = Int8WeightOnlyConfig() if quant_mode == "int8" else Int4WeightOnlyConfig()
-                        quantize_(t3.tfmr, config)
-                        _log.info("T3 Llama backbone: %s weight-only + BF16 compute (cc %d.x)", quant_mode.upper(), cc_major)
                     except ImportError:
                         _log.warning("T3_QUANTIZE=%s requested but torchao not installed, staying BF16", quant_mode)
-                        _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
-                    except Exception as e:
-                        _log.warning("T3_QUANTIZE=%s failed: %s — staying BF16", quant_mode, e)
-                        _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
+                        quant_mode = ""
+                    if quant_mode in ("int8", "int4"):
+                        try:
+                            config = Int8WeightOnlyConfig() if quant_mode == "int8" else Int4WeightOnlyConfig()
+                            quantize_(t3.tfmr, config)
+                            _log.info("T3 Llama backbone: %s weight-only + BF16 compute (cc %d.x)", quant_mode.upper(), cc_major)
+                        except Exception as e:
+                            _log.warning("T3_QUANTIZE=%s failed: %s — staying BF16", quant_mode, e)
+                            _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
                 else:
                     _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
             else:
