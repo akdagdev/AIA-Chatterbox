@@ -322,20 +322,39 @@ class FusedLlamaMLP(nn.Module):
 
 # ─── Replacement utility ───────────────────────────────────────────
 
+def _is_quantized(linear: nn.Module) -> bool:
+    """Check if a Linear layer has been quantized (torchao AffineQuantizedTensor)."""
+    if not hasattr(linear, 'weight'):
+        return False
+    return type(linear.weight).__name__ == 'AffineQuantizedTensor'
+
+
 def fuse_decoder_layers(model: nn.Module) -> dict:
-    """Replace components with fused versions. Returns counts."""
+    """Replace components with fused versions. Returns counts.
+
+    Weight-concatenation fusions (MLP gate_up, QKV) are skipped when weights
+    are quantized (torch.cat not supported on AffineQuantizedTensor).
+    Triton kernels (RMSNorm, RoPE, residual+norm) always work.
+    """
     if not HAS_TRITON:
         return {"mlp": 0, "rmsnorm": 0, "qkv": 0, "rope": 0}
 
     counts = {"mlp": 0, "rmsnorm": 0, "qkv": 0, "rope": 0}
 
+    # Detect quantization from first layer's MLP
+    quantized = False
+    if hasattr(model, 'layers') and len(model.layers) > 0:
+        first_mlp = model.layers[0].mlp
+        if hasattr(first_mlp, 'gate_proj') and _is_quantized(first_mlp.gate_proj):
+            quantized = True
+
     for layer in model.layers:
-        # Fuse MLP
-        if hasattr(layer, 'mlp'):
+        # Fuse MLP (skip if quantized — can't torch.cat quantized weights)
+        if not quantized and hasattr(layer, 'mlp'):
             layer.mlp = FusedLlamaMLP(layer.mlp)
             counts["mlp"] += 1
 
-        # Fuse RMSNorm (input + post_attention)
+        # Fuse RMSNorm (always works — no weight concatenation)
         if hasattr(layer, 'input_layernorm'):
             layer.input_layernorm = FusedRMSNorm(layer.input_layernorm)
             counts["rmsnorm"] += 1
@@ -343,13 +362,13 @@ def fuse_decoder_layers(model: nn.Module) -> dict:
             layer.post_attention_layernorm = FusedRMSNorm(layer.post_attention_layernorm)
             counts["rmsnorm"] += 1
 
-        # Fuse QKV projections
+        # Fuse QKV projections (skip if quantized)
         attn = layer.self_attn
-        if hasattr(attn, 'q_proj') and hasattr(attn, 'k_proj') and hasattr(attn, 'v_proj'):
+        if not quantized and hasattr(attn, 'q_proj') and hasattr(attn, 'k_proj') and hasattr(attn, 'v_proj'):
             attn._fused_qkv = FusedQKVProj(attn.q_proj, attn.k_proj, attn.v_proj)
             counts["qkv"] += 1
 
-        # Mark attention for fused RoPE
+        # Mark attention for fused RoPE (always works)
         attn._use_fused_rope = True
         counts["rope"] += 1
 
