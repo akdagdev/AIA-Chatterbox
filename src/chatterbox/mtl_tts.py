@@ -379,6 +379,10 @@ class ChatterboxMultilingualTTS:
         multi_step_n=4,
         t3_params={},
     ):
+        import os
+        if os.environ.get("T3_PROFILE") == "1":
+            t3_params = {**t3_params, "profile_t3": True, "benchmark_t3": True}
+
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
             supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
