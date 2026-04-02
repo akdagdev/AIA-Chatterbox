@@ -633,6 +633,7 @@ class T3BatchStepCUDAGraphWrapper:
         input_batch_size: int,
         stop_token_id: int,
         stop_token_tensor: torch.Tensor,  # Pre-allocated tensor
+        use_cfg: bool = True,
     ):
         self.generate_token_batch = generate_token_batch
         self.patched_model = patched_model
@@ -643,6 +644,7 @@ class T3BatchStepCUDAGraphWrapper:
         self.input_batch_size = input_batch_size
         self.stop_token_id = stop_token_id
         self.stop_token_tensor = stop_token_tensor
+        self.use_cfg = use_cfg
 
         self._bucket_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._bucket_static_tensors: Dict[int, dict] = {}
@@ -661,7 +663,7 @@ class T3BatchStepCUDAGraphWrapper:
         batch_idx: torch.Tensor,
         speech_pos_embedding_cache: torch.Tensor,
         generated_ids: torch.Tensor,
-        cfg_weight: float,
+        cfg_weight: torch.Tensor,
         temperature: float,
         finished_mask: torch.Tensor,
         max_position: Optional[int] = None,
@@ -683,7 +685,7 @@ class T3BatchStepCUDAGraphWrapper:
             static_tensors["batch_idx"] = batch_idx.clone()
             static_tensors["speech_pos_embedding_cache"] = speech_pos_embedding_cache.clone()
             static_tensors["generated_ids"] = generated_ids
-            static_tensors["cfg_weight"] = cfg_weight
+            static_tensors["cfg_weight"] = cfg_weight.clone()
             static_tensors["temperature"] = temperature
             static_tensors["finished_mask"] = finished_mask.clone()
             static_tensors["max_position"] = bucket_key
@@ -733,6 +735,7 @@ class T3BatchStepCUDAGraphWrapper:
                         static_tensors["max_position"],
                         static_tensors["attention_mask"],
                         static_tensors["cache_position"],
+                        self.use_cfg,
                     )
                     warmup_gen_ids.copy_(static_tensors["generated_ids"])
             del warmup_gen_ids
@@ -768,6 +771,7 @@ class T3BatchStepCUDAGraphWrapper:
                         static_tensors["max_position"],
                         static_tensors["attention_mask"],
                         static_tensors["cache_position"],
+                        self.use_cfg,
                     )
 
             self._bucket_static_tensors[bucket_key] = static_tensors
@@ -785,7 +789,7 @@ class T3BatchStepCUDAGraphWrapper:
         batch_idx: torch.Tensor,
         speech_pos_embedding_cache: torch.Tensor,
         generated_ids: torch.Tensor,
-        cfg_weight: float,
+        cfg_weight: torch.Tensor,
         temperature: float,
         repetition_penalty_processor: Any = None,
         min_p_warper: Any = None,
@@ -847,6 +851,7 @@ class T3BatchStepCUDAGraphWrapper:
                     max_position,
                     attention_mask,
                     cache_position,
+                    self.use_cfg,
                 )
             # Sync generated_ids with the real token so the loop state is correct
             generated_ids.copy_(original_gen_ids)
@@ -856,6 +861,8 @@ class T3BatchStepCUDAGraphWrapper:
             static_tensors["output_logits"].copy_(output_logits)
             static_tensors["i_tensor"].copy_(i_tensor)
             static_tensors["finished_mask"].copy_(finished_mask)
+            # Copy per-item cfg_weight — may differ between batch calls
+            static_tensors["cfg_weight"].copy_(cfg_weight)
 
             # Cross-call fix: inference_batch() creates new tensors each call.
             # The graph writes to addresses captured on the first call.  When

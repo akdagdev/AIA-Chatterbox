@@ -142,6 +142,8 @@ class SpeechRequest:
     audio_prompt_path: Optional[str] = None
     language_id: Optional[str] = None
     conditionals: Optional[Conditionals] = None
+    exaggeration: Optional[float] = None
+    cfg_weight: Optional[float] = None
 
 
 class ChatterboxMultilingualTTS:
@@ -612,24 +614,25 @@ class ChatterboxMultilingualTTS:
 
             for req in input_requests:
                 prompt_path = req.audio_prompt_path
-                current_exaggeration = exaggeration # Support per-request exaggeration? For now global.
-                
+                current_exaggeration = req.exaggeration if req.exaggeration is not None else exaggeration
+
                 t3_c = None
                 s3_d = None
-                
+
                 # Priority 1: Pre-computed conditionals
                 if req.conditionals:
                     t3_c = req.conditionals.t3
                     s3_d = req.conditionals.gen
-                
+
                 # Priority 2: Audio path (compute or cache)
                 elif prompt_path:
                     if prompt_path in prompt_cache:
                         t3_c, s3_d = prompt_cache[prompt_path]
                     else:
-                        t3_c, s3_d = self.get_conditioning_for_prompt(prompt_path, current_exaggeration)
+                        # Cache with canonical exaggeration=1.0; override emotion_adv per-item below
+                        t3_c, s3_d = self.get_conditioning_for_prompt(prompt_path, exaggeration=1.0)
                         prompt_cache[prompt_path] = (t3_c, s3_d)
-                
+
                 # Priority 3: Fallback to global defaults
                 else:
                     if hasattr(self, 'conds') and self.conds:
@@ -638,6 +641,12 @@ class ChatterboxMultilingualTTS:
                     else:
                         raise ValueError("Some requests missing audio_prompt_path/conditionals and no default voice loaded.")
 
+                # Override emotion_adv with per-item exaggeration
+                t3_c = T3Cond(
+                    speaker_emb=t3_c.speaker_emb,
+                    cond_prompt_speech_tokens=t3_c.cond_prompt_speech_tokens,
+                    emotion_adv=current_exaggeration * torch.ones(1, 1, 1, dtype=t3_c.speaker_emb.dtype, device=self.device),
+                )
                 t3_cond_list.append(t3_c)
                 item_ref_dicts.append(s3_d)
             
@@ -668,32 +677,32 @@ class ChatterboxMultilingualTTS:
             ).to(device=self.device)
 
         else:
-            # No custom prompts in requests, use global defaults
-            # ... (existing single speaker logic) ...
-            
-            # Use global audio_prompt_path if provided (but we successfully parsed it into requests above)
-            # If all requests have None prompt, but global arg was passed, input_requests has it.
-            # So `has_custom_prompts` would be true if global arg was passed.
-            # Thus we land here only if NO prompts provided anywhere.
-            
-            # Verify self.conds is set
+            # No custom prompts — use global defaults (self.conds)
             if not hasattr(self, 'conds') or self.conds is None:
                  pass # Warning/Error handled elsewhere or relying on pre-load
 
-            batched_t3_cond = self.conds.t3
-            
-            # Update exaggeration if needed (global only)
-            if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
-                _cond: T3Cond = self.conds.t3
-                # Optimization: Check if we need to clone.
-                # If we modify self.conds in place it affects future calls.
-                # Code below creates new T3Cond, updates self.conds.t3
-                self.conds.t3 = T3Cond(
-                    speaker_emb=_cond.speaker_emb,
-                    cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                    emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
+            _cond: T3Cond = self.conds.t3
+
+            # Build per-item emotion_adv from exaggeration values
+            exag_values = [
+                r.exaggeration if r.exaggeration is not None else exaggeration
+                for r in input_requests
+            ]
+            if len(set(exag_values)) > 1 or exag_values[0] != _cond.emotion_adv[0, 0, 0].item():
+                emotion_adv = torch.tensor(exag_values, dtype=_cond.speaker_emb.dtype, device=self.device).view(-1, 1, 1)
+                # Expand speaker_emb and prompt tokens to match batch dim —
+                # torch.cat in cond_enc does NOT broadcast, all tensors must have same batch size
+                speaker_emb = _cond.speaker_emb.expand(batch_size, -1, -1).contiguous()
+                cond_prompt = _cond.cond_prompt_speech_tokens
+                if cond_prompt is not None and cond_prompt.shape[0] == 1:
+                    cond_prompt = cond_prompt.expand(batch_size, -1).contiguous()
+                batched_t3_cond = T3Cond(
+                    speaker_emb=speaker_emb,
+                    cond_prompt_speech_tokens=cond_prompt,
+                    emotion_adv=emotion_adv,
                 ).to(device=self.device)
-                batched_t3_cond = self.conds.t3 # Update reference
+            else:
+                batched_t3_cond = _cond
 
             item_ref_dicts = [self.conds.gen] * batch_size
 
@@ -726,11 +735,19 @@ class ChatterboxMultilingualTTS:
         text_tokens = text_tokens.to(self.device)
         attention_mask = attention_mask.to(self.device)
 
-        # CFG: duplicate tokens, attention_mask, and T3Cond only when CFG is enabled
-        if cfg_weight > 0:
+        # Build per-item cfg_weight tensor
+        cfg_weights = [
+            r.cfg_weight if r.cfg_weight is not None else cfg_weight
+            for r in input_requests
+        ]
+        any_cfg = any(w > 0.0 for w in cfg_weights)
+        cfg_weight_tensor = torch.tensor(cfg_weights, dtype=torch.float32, device=self.device).view(-1, 1)
+
+        # CFG: duplicate tokens, attention_mask, and T3Cond only when any item uses CFG
+        if any_cfg:
             text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
             attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
-            
+
             # Only duplicate conds if we are NOT relying on broadcasting
             # If cond size is 1 and batch > 1, we leave it as 1 to broadcast to (2*batch) inside T3
             if not (t3_cond_to_use.speaker_emb.shape[0] == 1 and batch_size > 1):
@@ -751,7 +768,8 @@ class ChatterboxMultilingualTTS:
                 text_attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
-                cfg_weight=cfg_weight,
+                cfg_weight=cfg_weight_tensor,
+                use_cfg=any_cfg,
                 max_cache_len=max_cache_len,
                 repetition_penalty=repetition_penalty,
                 min_p=min_p,

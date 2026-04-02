@@ -108,7 +108,7 @@ class T3(nn.Module):
         t3_cond: T3Cond,
         text_tokens: torch.LongTensor,
         speech_tokens: torch.LongTensor,
-        cfg_weight: float = 0.0,
+        use_cfg: bool = False,
         text_attention_mask: Optional[Tensor] = None,
     ):
         if self.dtype != t3_cond.speaker_emb.dtype:
@@ -116,7 +116,7 @@ class T3(nn.Module):
         # prepare input embeddings (skip backbone tranformer embeddings)
         cond_emb = self.prepare_conditioning(t3_cond)  # (B, len_cond, dim)
         text_emb = self.text_emb(text_tokens)  # (B, len_text, dim)
-        if cfg_weight > 0.0:
+        if use_cfg:
             # Zero out the unconditioned half of the batch for CFG
             # In batch mode: first half is conditioned, second half is unconditioned
             batch_size = text_emb.size(0)
@@ -490,7 +490,7 @@ class T3(nn.Module):
             t3_cond=t3_cond,
             text_tokens=text_tokens,
             speech_tokens=initial_speech_tokens,
-            cfg_weight=cfg_weight,
+            use_cfg=cfg_weight > 0.0,
         )
 
         # In order to use the standard HF generate method, we need to extend some methods to inject our custom logic
@@ -845,6 +845,7 @@ class T3(nn.Module):
         top_p=1.0,
         repetition_penalty=1.2,
         cfg_weight=0.5,
+        use_cfg: Optional[bool] = None,
         max_cache_len=1500,
         profile_t3=False,
     ):
@@ -861,13 +862,22 @@ class T3(nn.Module):
         """
         _ensure_BOT_EOT(text_tokens, self.hp)
         text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
-        
+
+        # Normalize cfg_weight to tensor (batch_size, 1) for per-item CFG
+        if isinstance(cfg_weight, (int, float)):
+            cfg_weight = torch.tensor([[cfg_weight]], dtype=torch.float32, device=self.device)
+        cfg_weight = cfg_weight.to(device=self.device, dtype=torch.float32)
+
+        # Determine whether CFG is active (use_cfg flag controls Python-level branching)
+        if use_cfg is None:
+            use_cfg = (cfg_weight > 0.0).any().item()
+
         # Calculate actual input batch size (before CFG doubling)
-        if cfg_weight > 0.0:
+        if use_cfg:
             input_batch_size = text_tokens.shape[0] // 2
         else:
             input_batch_size = text_tokens.shape[0]
-        
+
         # Default initial speech tokens
         if initial_speech_tokens is None:
             initial_speech_tokens = self.hp.start_speech_token * torch.ones(
@@ -879,7 +889,7 @@ class T3(nn.Module):
             t3_cond=t3_cond,
             text_tokens=text_tokens,
             speech_tokens=initial_speech_tokens,
-            cfg_weight=cfg_weight,
+            use_cfg=use_cfg,
             text_attention_mask=text_attention_mask,
         )
 
@@ -1005,8 +1015,10 @@ class T3(nn.Module):
         # functionalization (confirmed on torch 2.10) — manual CUDA graphs bypass this.
         if not hasattr(self, "_batch_cudagraph_wrappers"):
             self._batch_cudagraph_wrappers = {}
-        if input_batch_size not in self._batch_cudagraph_wrappers:
-            self._batch_cudagraph_wrappers[input_batch_size] = T3BatchStepCUDAGraphWrapper(
+        # Key includes use_cfg because different CFG states produce different graph topologies
+        wrapper_key = (input_batch_size, use_cfg)
+        if wrapper_key not in self._batch_cudagraph_wrappers:
+            self._batch_cudagraph_wrappers[wrapper_key] = T3BatchStepCUDAGraphWrapper(
                 generate_t3_token_batch,
                 self.patched_model,
                 kv_cache,
@@ -1016,8 +1028,9 @@ class T3(nn.Module):
                 input_batch_size=input_batch_size,
                 stop_token_id=self.hp.stop_speech_token,
                 stop_token_tensor=pre_stop_token_tensor,
+                use_cfg=use_cfg,
             )
-        generate_token_batch = self._batch_cudagraph_wrappers[input_batch_size]
+        generate_token_batch = self._batch_cudagraph_wrappers[wrapper_key]
 
         # Pre-allocate cache_position tensor — updated in-place each iteration
         cache_pos = torch.tensor([seq_len], device=device, dtype=torch.long)
@@ -1327,7 +1340,7 @@ def generate_t3_token_batch(
     batch_idx: Tensor,
     position_embeds: Tensor,
     generated_ids: Tensor,
-    cfg_weight: float,
+    cfg_weight: Tensor,
     temperature: float,
     repetition_penalty_processor: RepetitionPenaltyLogitsProcessor,
     min_p_warper: MinPLogitsWarper,
@@ -1341,12 +1354,15 @@ def generate_t3_token_batch(
     max_position: Optional[int] = None,
     attention_mask: Optional[Tensor] = None,
     cache_position: Optional[Tensor] = None,
+    use_cfg: bool = True,
 ):
     """
     Batch-aware token generation for multiple inputs simultaneously.
 
     Args:
         input_batch_size: Number of actual input texts (before CFG doubling)
+        cfg_weight: Tensor of shape (batch_size, 1) with per-item CFG weights
+        use_cfg: Python-level flag controlling CFG branching (baked into CUDA graph at capture time)
         finished_mask: Boolean tensor tracking which batch items have generated EOS
         stop_token_tensor: Pre-allocated tensor for stop token (required for CUDA graphs)
         attention_mask: Optional 2D mask (eff_batch, max_cache_len) for batch padding
@@ -1354,14 +1370,15 @@ def generate_t3_token_batch(
     # logits shape: (effective_batch_size, 1, vocab_size) -> (effective_batch_size, vocab_size)
     logits = output_logits[:, -1, :]
 
-    # CFG: Use torch.chunk for proper batch handling
-    if cfg_weight > 0.0:
+    # CFG: per-item blending via tensor cfg_weight (batch_size, 1)
+    if use_cfg:
         # Split into conditioned and unconditioned halves
         logits_cond, logits_uncond = torch.chunk(logits, 2, dim=0)
+        # cfg_weight shape (batch_size, 1) broadcasts with (batch_size, vocab_size)
         logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
-    
+
     # logits shape now: (input_batch_size, vocab_size)
-    
+
     # Apply repetition penalty per batch item
     logits = repetition_penalty_processor(generated_ids, logits)
 
@@ -1381,7 +1398,7 @@ def generate_t3_token_batch(
         next_token = torch.where(finished_mask.unsqueeze(1), stop_token_tensor, next_token)
 
     # Update generated_ids for each batch item
-    # batch_idx is now a tensor of indices [0, 1, 2, ...] 
+    # batch_idx is now a tensor of indices [0, 1, 2, ...]
     # i_tensor is a scalar representing current timestep
     i_expanded = i_tensor.expand(input_batch_size)
     generated_ids.scatter_(1, i_expanded.unsqueeze(1), next_token)
@@ -1392,7 +1409,7 @@ def generate_t3_token_batch(
     next_token_embed = _speech_embedding_cache[next_token] + position_embed
 
     # For CFG: duplicate embeddings along batch dimension
-    if cfg_weight > 0.0:
+    if use_cfg:
         next_token_embed = torch.cat([next_token_embed, next_token_embed], dim=0)
 
     # Use explicit cache_position if provided; fallback to get_seq_length() heuristic.
