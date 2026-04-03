@@ -524,7 +524,8 @@ class T3(nn.Module):
         bos_embed = bos_embed + self._speech_pos_embedding_cache[0]
 
         # batch_size=2 for CFG
-        bos_embed = torch.cat([bos_embed, bos_embed])
+        if cfg_weight > 0.0:
+            bos_embed = torch.cat([bos_embed, bos_embed])
 
         # Combine condition and BOS token for the initial input
         inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
