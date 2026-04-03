@@ -347,6 +347,8 @@ class T3(nn.Module):
                 del self.cudagraph_wrapper
             if hasattr(self, 'prefill_wrapper'):
                 del self.prefill_wrapper
+            if hasattr(self, '_multistep_wrappers'):
+                del self._multistep_wrappers
         self._direct_cache, self._direct_cache_params = self._make_cache(
             config, max_batch_size, max_cache_len, device, dtype)
         return self._direct_cache
