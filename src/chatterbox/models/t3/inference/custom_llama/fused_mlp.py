@@ -23,6 +23,14 @@ except ImportError:
     HAS_TRITON = False
 
 
+def _next_power_of_2(n: int) -> int:
+    """Return the smallest power of 2 >= n."""
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
 # ─── Triton kernels ────────────────────────────────────────────────
 
 if HAS_TRITON:
@@ -30,25 +38,28 @@ if HAS_TRITON:
     def _rms_norm_kernel(
         x_ptr, weight_ptr, out_ptr,
         N_cols: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
         eps: tl.constexpr,
     ):
         """Fused RMSNorm: cast→variance→rsqrt→scale in one pass."""
         row = tl.program_id(0)
-        offs = tl.arange(0, N_cols)
+        offs = tl.arange(0, BLOCK_SIZE)
+        mask = offs < N_cols
 
-        x = tl.load(x_ptr + row * N_cols + offs).to(tl.float32)
-        w = tl.load(weight_ptr + offs).to(tl.float32)
+        x = tl.load(x_ptr + row * N_cols + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
 
         var = tl.sum(x * x, axis=0) / N_cols
         rrms = 1.0 / tl.sqrt(var + eps)
         result = x * rrms * w
 
-        tl.store(out_ptr + row * N_cols + offs, result.to(tl.bfloat16))
+        tl.store(out_ptr + row * N_cols + offs, result.to(tl.bfloat16), mask=mask)
 
     @triton.jit
     def _residual_rms_norm_kernel(
         x_ptr, residual_ptr, weight_ptr, out_ptr, residual_out_ptr,
         N_cols: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
         eps: tl.constexpr,
     ):
         """Fused residual add + RMSNorm in one pass.
@@ -57,40 +68,43 @@ if HAS_TRITON:
         Saves 1 kernel (add) + reads/writes of intermediate tensor.
         """
         row = tl.program_id(0)
-        offs = tl.arange(0, N_cols)
+        offs = tl.arange(0, BLOCK_SIZE)
+        mask = offs < N_cols
 
-        x = tl.load(x_ptr + row * N_cols + offs).to(tl.float32)
-        res = tl.load(residual_ptr + row * N_cols + offs).to(tl.float32)
-        w = tl.load(weight_ptr + offs).to(tl.float32)
+        x = tl.load(x_ptr + row * N_cols + offs, mask=mask, other=0.0).to(tl.float32)
+        res = tl.load(residual_ptr + row * N_cols + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
 
         # Residual add
         hidden = x + res
-        tl.store(residual_out_ptr + row * N_cols + offs, hidden.to(tl.bfloat16))
+        tl.store(residual_out_ptr + row * N_cols + offs, hidden.to(tl.bfloat16), mask=mask)
 
         # RMSNorm
         var = tl.sum(hidden * hidden, axis=0) / N_cols
         rrms = 1.0 / tl.sqrt(var + eps)
         result = hidden * rrms * w
 
-        tl.store(out_ptr + row * N_cols + offs, result.to(tl.bfloat16))
+        tl.store(out_ptr + row * N_cols + offs, result.to(tl.bfloat16), mask=mask)
 
     @triton.jit
     def _silu_mul_fused_kernel(
         gate_up_ptr, out_ptr,
         stride_row,
         intermediate_size: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
     ):
         """Fused SiLU(gate) * up reading directly from concatenated gate_up tensor."""
         row = tl.program_id(0)
-        offs = tl.arange(0, intermediate_size)
+        offs = tl.arange(0, BLOCK_SIZE)
+        mask = offs < intermediate_size
 
         base = row * stride_row
-        gate = tl.load(gate_up_ptr + base + offs).to(tl.float32)
-        up = tl.load(gate_up_ptr + base + intermediate_size + offs).to(tl.float32)
+        gate = tl.load(gate_up_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(gate_up_ptr + base + intermediate_size + offs, mask=mask, other=0.0).to(tl.float32)
 
         result = gate * tl.sigmoid(gate) * up
 
-        tl.store(out_ptr + row * intermediate_size + offs, result.to(tl.bfloat16))
+        tl.store(out_ptr + row * intermediate_size + offs, result.to(tl.bfloat16), mask=mask)
 
     @triton.jit
     def _rotary_emb_kernel(
@@ -164,6 +178,7 @@ class FusedRMSNorm(nn.Module):
             _rms_norm_kernel[(x.shape[0],)](
                 x, self.weight, out,
                 N_cols=self.hidden_size,
+                BLOCK_SIZE=_next_power_of_2(self.hidden_size),
                 eps=self.variance_epsilon,
             )
             return out.view_as(hidden_states)
@@ -187,6 +202,7 @@ def fused_residual_rmsnorm(x, residual, weight, eps, hidden_size):
         _residual_rms_norm_kernel[(x_flat.shape[0],)](
             x_flat, res_flat, weight, out, new_residual,
             N_cols=hidden_size,
+            BLOCK_SIZE=_next_power_of_2(hidden_size),
             eps=eps,
         )
         return out.view_as(x), new_residual.view_as(x)
@@ -311,6 +327,7 @@ class FusedLlamaMLP(nn.Module):
                 gate_up_flat, intermediate.view(-1, self.intermediate_size),
                 stride_row=2 * self.intermediate_size,
                 intermediate_size=self.intermediate_size,
+                BLOCK_SIZE=_next_power_of_2(self.intermediate_size),
             )
         else:
             gate = gate_up[..., :self.intermediate_size]
