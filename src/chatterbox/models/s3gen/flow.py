@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import os
 import random
 from typing import Dict, Optional
 
@@ -21,6 +22,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 from .utils.mask import make_pad_mask
 from .configs import CFM_PARAMS
+
+S3GEN_EULER_STEPS = int(os.environ.get("S3GEN_EULER_STEPS", "5"))
 
 
 class MaskedDiffWithXvec(torch.nn.Module):
@@ -266,7 +269,7 @@ class MaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=5,
+            n_timesteps=S3GEN_EULER_STEPS,
             prompt_len=mel_len1, # Decoder needs to know where to start generating? 
                                  # If implementation relies on single int prompt_len, batching variable prompt is HARD.
                                  # We might need to check decoder implementation.
@@ -476,7 +479,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=5
+            n_timesteps=S3GEN_EULER_STEPS,
         )
         
         # Slice output

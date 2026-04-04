@@ -494,9 +494,10 @@ class ChatterboxMultilingualTTS:
         total = time.perf_counter() - t0
         n_tokens = len(speech_tokens)
         audio_dur = n_tokens * 2 * 480 / self.sr
+        from .models.s3gen.flow import S3GEN_EULER_STEPS
         _log.info(
             f"[SINGLE] T3={t_t3:.3f}s ({n_tokens} tokens, {n_tokens/t_t3:.0f} tok/s) | "
-            f"S3Gen={t_s3:.3f}s | total={total:.3f}s | "
+            f"S3Gen={t_s3:.3f}s (euler={S3GEN_EULER_STEPS}) | total={total:.3f}s | "
             f"audio={audio_dur:.2f}s | RTF={total/audio_dur:.3f}"
         )
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
