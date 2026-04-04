@@ -269,12 +269,17 @@ class T3(nn.Module):
             # - QKV projection: 3 matmuls → 1 fused matmul
             # - MLP gate+up: 2 matmuls → 1 fused matmul + SiLU*mul in 1 Triton kernel
             # Reduces per-layer kernel count from ~34 to ~17 (30 layers: ~1020 → ~510).
+            # Skip when T3_COMPILE=1: torch.compile's inductor handles fusion and
+            # custom Triton kernels use .view() which breaks dynamo's symbolic shapes.
             import os
-            if self.device.type == "cuda" and os.environ.get("T3_NO_FUSED") != "1":
+            _use_compile = os.environ.get("T3_COMPILE") == "1"
+            if self.device.type == "cuda" and os.environ.get("T3_NO_FUSED") != "1" and not _use_compile:
                 from .inference.custom_llama.fused_mlp import fuse_decoder_layers
                 counts = fuse_decoder_layers(patched_model.model)
                 if any(counts.values()):
                     logger.info("T3 fused: %d MLP, %d RMSNorm, %d QKV, %d RoPE", counts["mlp"], counts["rmsnorm"], counts["qkv"], counts["rope"])
+            elif _use_compile:
+                logger.info("T3 fused kernels skipped — torch.compile handles fusion")
 
             # Optional: torch.compile the Llama backbone with inductor for kernel fusion.
             # Inductor can fuse multiple ops per layer into fewer kernels, reducing
