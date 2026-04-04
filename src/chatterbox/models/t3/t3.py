@@ -269,56 +269,12 @@ class T3(nn.Module):
             # - QKV projection: 3 matmuls → 1 fused matmul
             # - MLP gate+up: 2 matmuls → 1 fused matmul + SiLU*mul in 1 Triton kernel
             # Reduces per-layer kernel count from ~34 to ~17 (30 layers: ~1020 → ~510).
-            # Skip when T3_COMPILE=1: torch.compile's inductor handles fusion and
-            # custom Triton kernels use .view() which breaks dynamo's symbolic shapes.
             import os
-            _use_compile = os.environ.get("T3_COMPILE") == "1"
-            if self.device.type == "cuda" and os.environ.get("T3_NO_FUSED") != "1" and not _use_compile:
+            if self.device.type == "cuda" and os.environ.get("T3_NO_FUSED") != "1":
                 from .inference.custom_llama.fused_mlp import fuse_decoder_layers
                 counts = fuse_decoder_layers(patched_model.model)
                 if any(counts.values()):
                     logger.info("T3 fused: %d MLP, %d RMSNorm, %d QKV, %d RoPE", counts["mlp"], counts["rmsnorm"], counts["qkv"], counts["rope"])
-            elif _use_compile:
-                logger.info("T3 fused kernels skipped — torch.compile handles fusion")
-
-            # Optional: torch.compile the Llama backbone with inductor for kernel fusion.
-            # Inductor can fuse multiple ops per layer into fewer kernels, reducing
-            # the ~210 kernel dispatches per token. Compatible with manual CUDA graphs
-            # since compile targets the inner model, not the graph-captured function.
-            # Set T3_COMPILE=1 to enable. Compilation is triggered eagerly below
-            # (not lazily on first inference) to avoid compiling inside CUDA graph
-            # capture context, which would fail with "operation not permitted".
-            if self.device.type == "cuda" and os.environ.get("T3_COMPILE") == "1":
-                patched_model.model = torch.compile(patched_model.model)
-                logger.info("T3 Llama backbone: torch.compile enabled, triggering compilation...")
-                # Force compilation NOW with dummy inputs so inductor constant-folds
-                # and allocates before any CUDA graph capture happens.
-                _hidden = self.cfg.hidden_size
-                _dummy_embeds = torch.zeros(2, 1, _hidden, dtype=torch.bfloat16, device=self.device)
-                from transformers.cache_utils import StaticCache
-                _dummy_cache = StaticCache(
-                    config=self.cfg, max_batch_size=2, max_cache_len=256,
-                    device=self.device, dtype=torch.bfloat16,
-                )
-                _dummy_pos = torch.zeros(1, dtype=torch.long, device=self.device)
-                with torch.inference_mode():
-                    # Prefill pass (seq > 1)
-                    _prefill = torch.zeros(2, 64, _hidden, dtype=torch.bfloat16, device=self.device)
-                    _ = patched_model.model(
-                        inputs_embeds=_prefill,
-                        past_key_values=_dummy_cache,
-                        cache_position=torch.arange(64, device=self.device),
-                    )
-                    # Decode pass (seq = 1) — this is the hot path
-                    _ = patched_model.model(
-                        inputs_embeds=_dummy_embeds,
-                        past_key_values=_dummy_cache,
-                        cache_position=torch.tensor([64], device=self.device),
-                        max_position=256,
-                    )
-                del _dummy_embeds, _dummy_cache, _dummy_pos, _prefill
-                torch.cuda.empty_cache()
-                logger.info("T3 Llama backbone: torch.compile compilation complete")
 
             self.patched_model = patched_model
             self.compiled = True
@@ -522,15 +478,6 @@ class T3(nn.Module):
                 forward passes in a single graph, amortizing Python overhead by N.
                 Only effective with generate_token_backend="cudagraphs-manual".
         """
-        # torch.compile and manual CUDA graphs are incompatible — inductor's
-        # constant folding allocates GPU memory which fails inside graph capture.
-        # When T3_COMPILE=1, force eager generation loop and let inductor's
-        # kernel fusion provide the speedup instead of manual CUDA graphs.
-        import os
-        if os.environ.get("T3_COMPILE") == "1":
-            generate_token_backend = "eager"
-            multi_step_n = 1
-
         # Validate / sanitize inputs
         assert prepend_prompt_speech_tokens is None, "not implemented"
         _ensure_BOT_EOT(text_tokens, self.hp)
