@@ -214,10 +214,13 @@ class ChatterboxMultilingualTTS:
         # BF16 conversion is applied unconditionally on all CUDA GPUs including
         # Blackwell (sm_120) — bfloat16 is natively supported on all sm_80+.
         # Optional weight quantization (set T3_QUANTIZE env var):
-        #   T3_QUANTIZE=int8 — INT8 weight-only (2× bandwidth reduction vs BF16)
-        #   T3_QUANTIZE=int4 — INT4 weight-only (4× vs BF16, quality risk)
-        # Stores Llama weights quantized, dequantizes to BF16 on-the-fly during matmul.
-        # Requires torchao package. Quality impact needs per-GPU testing.
+        #   T3_QUANTIZE=fp8  — FP8 W8A8 dynamic (best: uses FP8 tensor cores, no dequant)
+        #   T3_QUANTIZE=int8 — INT8 W8A8 dynamic (uses INT8 tensor cores, no dequant)
+        #   T3_QUANTIZE=int4 — INT4 weight-only (4× bandwidth vs BF16, quality risk)
+        # FP8/INT8 W8A8 run matmul directly in reduced precision — no dequantize
+        # overhead. Weight-only modes (int4) dequantize to BF16 on-the-fly, which
+        # adds overhead that can outweigh bandwidth savings on small models.
+        # Requires torchao package. FP8 needs sm_89+ (Ada/Blackwell).
         if str(device).startswith("cuda"):
             cc_major, _ = torch.cuda.get_device_capability(device)
             t3.tfmr.to(torch.bfloat16)  # Llama backbone only
@@ -225,26 +228,33 @@ class ChatterboxMultilingualTTS:
             # Fuse BEFORE quantization so fused weights (QKV, MLP gate_up) are
             # regular tensors that torchao can quantize. Reversing this order
             # makes torch.cat fail on AffineQuantizedTensor → fusions skipped →
-            # INT8 bandwidth gain cancelled by extra kernel launches.
+            # quantization bandwidth gain cancelled by extra kernel launches.
             t3.init_patched_model()
 
             quant_mode = os.environ.get("T3_QUANTIZE", "").lower()
-            if quant_mode in ("int8", "int4"):
+            if quant_mode in ("fp8", "int8", "int4"):
                 try:
-                    from torchao.quantization import (
-                        Int4WeightOnlyConfig,
-                        Int8WeightOnlyConfig,
-                        quantize_,
-                    )
+                    from torchao.quantization import quantize_
+                    if quant_mode == "fp8":
+                        from torchao.quantization import Float8DynamicActivationFloat8WeightConfig
+                    elif quant_mode == "int8":
+                        from torchao.quantization import Int8DynamicActivationInt8WeightConfig
+                    else:
+                        from torchao.quantization import Int4WeightOnlyConfig
                 except ImportError:
                     _log.warning("T3_QUANTIZE=%s requested but torchao not installed, staying BF16", quant_mode)
                     quant_mode = ""
-                if quant_mode in ("int8", "int4"):
+                if quant_mode in ("fp8", "int8", "int4"):
                     try:
-                        config = Int8WeightOnlyConfig() if quant_mode == "int8" else Int4WeightOnlyConfig()
-                        # Quantize the fused model (patched_model.model = t3.tfmr)
+                        if quant_mode == "fp8":
+                            config = Float8DynamicActivationFloat8WeightConfig()
+                        elif quant_mode == "int8":
+                            config = Int8DynamicActivationInt8WeightConfig()
+                        else:
+                            config = Int4WeightOnlyConfig()
                         quantize_(t3.patched_model.model, config)
-                        _log.info("T3 Llama backbone: %s weight-only + BF16 compute (cc %d.x)", quant_mode.upper(), cc_major)
+                        _mode_desc = {"fp8": "FP8 W8A8", "int8": "INT8 W8A8", "int4": "INT4 weight-only"}
+                        _log.info("T3 Llama backbone: %s + reduced compute (cc %d.x)", _mode_desc[quant_mode], cc_major)
                     except Exception as e:
                         _log.warning("T3_QUANTIZE=%s failed: %s — staying BF16", quant_mode, e)
                         _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
