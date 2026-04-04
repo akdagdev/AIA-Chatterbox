@@ -276,6 +276,15 @@ class T3(nn.Module):
                 if any(counts.values()):
                     logger.info("T3 fused: %d MLP, %d RMSNorm, %d QKV, %d RoPE", counts["mlp"], counts["rmsnorm"], counts["qkv"], counts["rope"])
 
+            # Optional: torch.compile the Llama backbone with inductor for kernel fusion.
+            # Inductor can fuse multiple ops per layer into fewer kernels, reducing
+            # the ~210 kernel dispatches per token. Compatible with manual CUDA graphs
+            # since compile targets the inner model, not the graph-captured function.
+            # Set T3_COMPILE=1 to enable. First inference triggers compilation (~30-60s).
+            if self.device.type == "cuda" and os.environ.get("T3_COMPILE") == "1":
+                patched_model.model = torch.compile(patched_model.model)
+                logger.info("T3 Llama backbone: torch.compile enabled")
+
             self.patched_model = patched_model
             self.compiled = True
 
