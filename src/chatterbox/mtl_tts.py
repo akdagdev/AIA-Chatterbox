@@ -146,6 +146,16 @@ class SpeechRequest:
     cfg_weight: Optional[float] = None
 
 
+@dataclass
+class T3PhaseResult:
+    """Output of the T3 phase, input to the S3Gen phase.
+    Allows pipelining: run S3Gen for batch N while T3 runs for batch N+1."""
+    speech_tokens: torch.Tensor          # (batch_size, seq_len) — raw T3 output, PAD→EOS already applied
+    item_ref_dicts: list                  # list[dict] — per-item S3Gen conditioning
+    batch_size: int
+    t_t3: float                           # T3 wall-clock seconds (for logging)
+
+
 class ChatterboxMultilingualTTS:
     ENC_COND_LEN = 6 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
@@ -519,12 +529,12 @@ class ChatterboxMultilingualTTS:
     ):
         """
         Batch TTS generation for multiple texts simultaneously.
-        
+
         Args:
             texts: List of text strings OR List of SpeechRequest objects
             language_id: Language code (e.g., 'en', 'de', 'fr') - used if not in SpeechRequest
             audio_prompt_path: Optional path for voice cloning - used if not in SpeechRequest
-            
+
         Returns:
             List of torch.Tensor, each containing generated audio waveform
         """
@@ -551,7 +561,19 @@ class ChatterboxMultilingualTTS:
         finally:
             self._batch_lock.release()
 
-    def _generate_batch_impl(
+    def generate_batch_t3(self, **kwargs) -> T3PhaseResult:
+        """Public T3-only phase.  Caller MUST hold _batch_lock or guarantee
+        single-threaded access.  Returns T3PhaseResult for generate_batch_s3gen()."""
+        return self._t3_phase(**kwargs)
+
+    def generate_batch_s3gen(self, t3_result: T3PhaseResult) -> list:
+        """Public S3Gen-only phase.  Can run concurrently with a T3 call
+        on a different CUDA stream."""
+        return self._s3gen_phase(t3_result)
+
+    # ─── Phase 1: T3 (text → speech tokens) ────────────────────────────
+
+    def _t3_phase(
         self,
         texts: list,
         language_id: str,
@@ -565,10 +587,13 @@ class ChatterboxMultilingualTTS:
         min_p=0.05,
         top_p=1.0,
         t3_params={},
-    ):
+    ) -> T3PhaseResult:
+        """Text → speech tokens via T3.  Returns a T3PhaseResult that can be
+        fed directly to _s3gen_phase().  Designed so that S3Gen for the
+        *previous* batch can run concurrently on separate CUDA streams while
+        this method occupies the default stream."""
+
         batch_size = len(texts)
-        if batch_size == 0:
-            return []
 
         # Convert simple list of strings to SpeechRequest list for unified processing
         input_requests = []
@@ -592,16 +617,13 @@ class ChatterboxMultilingualTTS:
         else:
             # Assume it is already a list of SpeechRequests
             input_requests = texts
-        
+
         # Prepare text list for tokenization
         processed_texts = [r.text for r in input_requests]
-        
+
         # Determine language for each item (fallback to global arg if missing in request)
-        # Note: current tokenizer `text_to_tokens_batch` accepts a single language_id for the whole batch
-        # If mixed languages are needed, tokenizer needs update. For now, we enforce single language or assume primary language.
-        # Checking if all requests have same language or if we use global
         req_lang = input_requests[0].language_id or language_id
-        
+
         # Validate language_id
         if req_lang and req_lang.lower() not in SUPPORTED_LANGUAGES:
             supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
@@ -614,19 +636,14 @@ class ChatterboxMultilingualTTS:
         batched_t3_cond = None
         item_ref_dicts = []
 
-        # Check if we have mixed prompts or single prompt
-        # We need to build conditioning for EACH item to be safe, or optimize if all same.
-        # Optimization: check if all prompt paths are None or same string?
-        # For simplicity and correctness with the new Struct design, let's process each one.
-        
         has_custom_prompts = any(r.audio_prompt_path is not None for r in input_requests)
-        
+
         if has_custom_prompts or any(r.conditionals is not None for r in input_requests):
             # Multi-speaker batching (or explicitly specified single speaker)
             t3_cond_list = []
-            
+
             # Simple cache for path-based prompts within this batch
-            prompt_cache = {} 
+            prompt_cache = {}
 
             for req in input_requests:
                 prompt_path = req.audio_prompt_path
@@ -645,7 +662,6 @@ class ChatterboxMultilingualTTS:
                     if prompt_path in prompt_cache:
                         t3_c, s3_d = prompt_cache[prompt_path]
                     else:
-                        # Cache with canonical exaggeration=1.0; override emotion_adv per-item below
                         t3_c, s3_d = self.get_conditioning_for_prompt(prompt_path, exaggeration=1.0)
                         prompt_cache[prompt_path] = (t3_c, s3_d)
 
@@ -665,15 +681,13 @@ class ChatterboxMultilingualTTS:
                 )
                 t3_cond_list.append(t3_c)
                 item_ref_dicts.append(s3_d)
-            
-            # Merge T3Conds logic...
-            # Stack speaker embeddings
+
+            # Merge T3Conds
             speaker_emb = torch.cat([c.speaker_emb for c in t3_cond_list], dim=0)
             emotion_adv = torch.cat([c.emotion_adv for c in t3_cond_list], dim=0)
-            
-            # Stack prompt tokens
+
             prompt_tokens_list = [c.cond_prompt_speech_tokens for c in t3_cond_list if c.cond_prompt_speech_tokens is not None]
-            
+
             cond_prompt_speech_tokens = None
             if prompt_tokens_list:
                  if len(prompt_tokens_list) == len(t3_cond_list):
@@ -685,7 +699,7 @@ class ChatterboxMultilingualTTS:
                              t = F.pad(t, (0, pad_amount), value=0)
                          padded_prompts.append(t)
                      cond_prompt_speech_tokens = torch.cat(padded_prompts, dim=0)
-            
+
             batched_t3_cond = T3Cond(
                 speaker_emb=speaker_emb,
                 cond_prompt_speech_tokens=cond_prompt_speech_tokens,
@@ -699,15 +713,12 @@ class ChatterboxMultilingualTTS:
 
             _cond: T3Cond = self.conds.t3
 
-            # Build per-item emotion_adv from exaggeration values
             exag_values = [
                 r.exaggeration if r.exaggeration is not None else exaggeration
                 for r in input_requests
             ]
             if len(set(exag_values)) > 1 or exag_values[0] != _cond.emotion_adv[0, 0, 0].item():
                 emotion_adv = torch.tensor(exag_values, dtype=_cond.speaker_emb.dtype, device=self.device).view(-1, 1, 1)
-                # Expand speaker_emb and prompt tokens to match batch dim —
-                # torch.cat in cond_enc does NOT broadcast, all tensors must have same batch size
                 speaker_emb = _cond.speaker_emb.expand(batch_size, -1, -1).contiguous()
                 cond_prompt = _cond.cond_prompt_speech_tokens
                 if cond_prompt is not None and cond_prompt.shape[0] == 1:
@@ -726,8 +737,6 @@ class ChatterboxMultilingualTTS:
         t3_cond_to_use = batched_t3_cond if batched_t3_cond else self.conds.t3
 
         # Prepare language_id list
-        # If input_requests (SpeechRequest objects) have language_id, use it.
-        # Fallback to global language_id.
         language_ids = []
         for r in input_requests:
             lid = r.language_id or language_id
@@ -741,9 +750,9 @@ class ChatterboxMultilingualTTS:
         normalized_texts = [punc_norm(t) for t in processed_texts]
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token
-        
+
         text_tokens, attention_mask = self.tokenizer.text_to_tokens_batch(
-            normalized_texts, 
+            normalized_texts,
             language_id=language_ids,
             sot_token=sot,
             eot_token=eot
@@ -764,8 +773,6 @@ class ChatterboxMultilingualTTS:
             text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
             attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
 
-            # Only duplicate conds if we are NOT relying on broadcasting
-            # If cond size is 1 and batch > 1, we leave it as 1 to broadcast to (2*batch) inside T3
             if not (t3_cond_to_use.speaker_emb.shape[0] == 1 and batch_size > 1):
                 cfg_t3_cond = T3Cond(
                     speaker_emb=torch.cat([t3_cond_to_use.speaker_emb, t3_cond_to_use.speaker_emb], dim=0),
@@ -774,9 +781,8 @@ class ChatterboxMultilingualTTS:
                 ).to(device=self.device)
                 t3_cond_to_use = cfg_t3_cond
 
-        t0 = time.perf_counter()
+        # ── T3 inference ──
         with torch.inference_mode():
-            # T3 batch inference
             t_t3_start = time.perf_counter()
             speech_tokens = self.t3.inference_batch(
                 t3_cond=t3_cond_to_use,
@@ -795,73 +801,80 @@ class ChatterboxMultilingualTTS:
             t_t3 = time.perf_counter() - t_t3_start
 
             # Replace PAD tokens with EOS — safety net for items that didn't generate EOS.
-            # Without this, PAD (6563) passes through drop_invalid_tokens → 60s garbage audio.
             PAD_TOKEN_ID = self.t3.hp.stop_speech_token + 1  # 6563
             speech_tokens = speech_tokens.clone()
             speech_tokens[speech_tokens == PAD_TOKEN_ID] = EOS
 
-            # S3Gen: Per-item sequential inference using FP16 copies
-            # Tensor batching causes OOM due to O(T²) attention in UpsampleConformerEncoder.
-            # Per-item reduces attention memory from B×8×T²×4B (~655 MiB) to 1×8×T²×2B (~41 MiB).
+        return T3PhaseResult(
+            speech_tokens=speech_tokens,
+            item_ref_dicts=item_ref_dicts,
+            batch_size=batch_size,
+            t_t3=t_t3,
+        )
 
-            # Use FP16 S3Gen copies (copy 0 = FP32, reserved for embed_ref)
-            s3gen_workers = self.s3gen_copies[1:] if len(self.s3gen_copies) > 1 else [self.s3gen]
-            n_workers = len(s3gen_workers)
+    # ─── Phase 2: S3Gen (speech tokens → waveform) ───────────────────
 
-            # Minimum tokens needed for S3Gen (HiFiGAN f0_predictor Conv1d kernel_size=3
-            # needs at least 2 mel frames → 1 token, but 3 tokens is a safe minimum)
-            MIN_SPEECH_TOKENS = 3
+    def _s3gen_phase(self, t3_result: T3PhaseResult) -> list:
+        """Speech tokens → waveforms via S3Gen.  Runs on dedicated CUDA
+        streams (one per FP16 copy) so it can overlap with a concurrent
+        T3 call on the default stream."""
 
-            # Pre-extract valid tokens for all items
-            item_valid_tokens = []
-            token_counts = []
-            for i in range(batch_size):
-                valid_tokens = drop_invalid_tokens(speech_tokens[i]).to(self.device)
-                valid_tokens = valid_tokens[valid_tokens < SPEECH_VOCAB_SIZE]
-                item_valid_tokens.append(valid_tokens)
-                token_counts.append(len(valid_tokens) if len(valid_tokens) >= MIN_SPEECH_TOKENS else 0)
+        batch_size = t3_result.batch_size
+        speech_tokens = t3_result.speech_tokens
+        item_ref_dicts = t3_result.item_ref_dicts
 
-            use_cuda_streams = torch.cuda.is_available()
+        s3gen_workers = self.s3gen_copies[1:] if len(self.s3gen_copies) > 1 else [self.s3gen]
+        n_workers = len(s3gen_workers)
 
-            # Lazy-init per-worker CUDA streams (one per FP16 copy, reused across batches)
-            if use_cuda_streams:
-                if not hasattr(self, '_s3gen_streams') or len(self._s3gen_streams) != n_workers:
-                    self._s3gen_streams = [torch.cuda.Stream() for _ in range(n_workers)]
+        MIN_SPEECH_TOKENS = 3
 
-            # Group items by worker (round-robin)
-            worker_queues = [[] for _ in range(n_workers)]
-            for i in range(batch_size):
-                if token_counts[i] > 0:
-                    worker_queues[i % n_workers].append(i)
+        # Pre-extract valid tokens for all items
+        item_valid_tokens = []
+        token_counts = []
+        for i in range(batch_size):
+            valid_tokens = drop_invalid_tokens(speech_tokens[i]).to(self.device)
+            valid_tokens = valid_tokens[valid_tokens < SPEECH_VOCAB_SIZE]
+            item_valid_tokens.append(valid_tokens)
+            token_counts.append(len(valid_tokens) if len(valid_tokens) >= MIN_SPEECH_TOKENS else 0)
 
-            # Each worker processes its assigned items sequentially on its own CUDA stream.
-            # Workers run concurrently → ~n_workers× S3Gen speedup.
-            raw_wavs = {}  # item_idx → tensor on GPU
+        use_cuda_streams = torch.cuda.is_available()
 
-            def run_worker(worker_idx, item_indices):
-                worker = s3gen_workers[worker_idx]
-                stream = self._s3gen_streams[worker_idx] if use_cuda_streams else None
-                for idx in item_indices:
-                    tokens = item_valid_tokens[idx]
-                    if stream is not None:
-                        with torch.cuda.stream(stream):
-                            wav, _ = worker.inference(
-                                speech_tokens=tokens,
-                                ref_dict=item_ref_dicts[idx],
-                            )
-                            raw_wavs[idx] = wav.squeeze(0)[: len(tokens) * 2 * 480]
-                    else:
+        # Lazy-init per-worker CUDA streams (one per FP16 copy, reused across batches)
+        if use_cuda_streams:
+            if not hasattr(self, '_s3gen_streams') or len(self._s3gen_streams) != n_workers:
+                self._s3gen_streams = [torch.cuda.Stream() for _ in range(n_workers)]
+
+        # Group items by worker (round-robin)
+        worker_queues = [[] for _ in range(n_workers)]
+        for i in range(batch_size):
+            if token_counts[i] > 0:
+                worker_queues[i % n_workers].append(i)
+
+        raw_wavs = {}  # item_idx → tensor on GPU
+
+        def run_worker(worker_idx, item_indices):
+            worker = s3gen_workers[worker_idx]
+            stream = self._s3gen_streams[worker_idx] if use_cuda_streams else None
+            for idx in item_indices:
+                tokens = item_valid_tokens[idx]
+                if stream is not None:
+                    with torch.cuda.stream(stream):
                         wav, _ = worker.inference(
                             speech_tokens=tokens,
                             ref_dict=item_ref_dicts[idx],
                         )
                         raw_wavs[idx] = wav.squeeze(0)[: len(tokens) * 2 * 480]
-                # Sync once at end of worker — all items are GPU tensors,
-                # no CPU access needed until results assembly.
-                if stream is not None:
-                    stream.synchronize()
+                else:
+                    wav, _ = worker.inference(
+                        speech_tokens=tokens,
+                        ref_dict=item_ref_dicts[idx],
+                    )
+                    raw_wavs[idx] = wav.squeeze(0)[: len(tokens) * 2 * 480]
+            if stream is not None:
+                stream.synchronize()
 
-            t_s3_start = time.perf_counter()
+        t_s3_start = time.perf_counter()
+        with torch.inference_mode():
             with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
                 futs = [
                     executor.submit(run_worker, w, worker_queues[w])
@@ -869,28 +882,65 @@ class ChatterboxMultilingualTTS:
                 ]
                 for f in futs:
                     f.result()  # re-raise any exceptions
-            t_s3_total = time.perf_counter() - t_s3_start
+        t_s3_total = time.perf_counter() - t_s3_start
 
-            # Assemble results in original order, apply watermark (CPU-side, safe)
-            results = []
-            for i in range(batch_size):
-                if token_counts[i] == 0:
-                    _log.warning(
-                        f"Batch item {i} has only {len(item_valid_tokens[i])} valid speech tokens "
-                        f"(min={MIN_SPEECH_TOKENS}), returning silence"
-                    )
-                    results.append(torch.zeros(1, int(0.1 * self.sr)))
-                    continue
-                wav_numpy = raw_wavs[i].detach().cpu().numpy()
-                watermarked_wav = self.watermarker.apply_watermark(wav_numpy, sample_rate=self.sr)
-                results.append(torch.from_numpy(watermarked_wav).unsqueeze(0))
+        # Assemble results in original order, apply watermark (CPU-side, safe)
+        results = []
+        for i in range(batch_size):
+            if token_counts[i] == 0:
+                _log.warning(
+                    f"Batch item {i} has only {len(item_valid_tokens[i])} valid speech tokens "
+                    f"(min={MIN_SPEECH_TOKENS}), returning silence"
+                )
+                results.append(torch.zeros(1, int(0.1 * self.sr)))
+                continue
+            wav_numpy = raw_wavs[i].detach().cpu().numpy()
+            watermarked_wav = self.watermarker.apply_watermark(wav_numpy, sample_rate=self.sr)
+            results.append(torch.from_numpy(watermarked_wav).unsqueeze(0))
 
-        total = time.perf_counter() - t0
+        # Log timing
         total_tokens = sum(token_counts)
         total_audio = sum(n * 2 * 480 / self.sr for n in token_counts)
+        t_t3 = t3_result.t_t3
+        total = t_t3 + t_s3_total
         _log.info(
             f"[BATCH={batch_size}] T3={t_t3:.3f}s ({total_tokens} tokens, {total_tokens/t_t3:.0f} tok/s) | "
             f"S3Gen={t_s3_total:.3f}s (per-item avg {t_s3_total/max(batch_size,1):.3f}s) | "
             f"total={total:.3f}s | audio={total_audio:.2f}s | RTF={total/max(total_audio,1e-6):.3f}"
         )
         return results
+
+    # ─── Combined (backward-compatible) ───────────────────────────────
+
+    def _generate_batch_impl(
+        self,
+        texts: list,
+        language_id: str,
+        audio_prompt_path: Union[str, List[str]] = None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        max_new_tokens=1000,
+        max_cache_len=1500,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        t3_params={},
+    ):
+        if len(texts) == 0:
+            return []
+        t3_result = self._t3_phase(
+            texts=texts,
+            language_id=language_id,
+            audio_prompt_path=audio_prompt_path,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            max_cache_len=max_cache_len,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            top_p=top_p,
+            t3_params=t3_params,
+        )
+        return self._s3gen_phase(t3_result)
