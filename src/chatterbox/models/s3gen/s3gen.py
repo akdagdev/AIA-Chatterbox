@@ -258,6 +258,10 @@ class S3Token2Mel(torch.nn.Module):
         if ref_dict is None:
             ref_dict = self.embed_ref(ref_wav, ref_sr)
         else:
+            # Shallow-copy the dict so we never mutate the caller's original
+            # (the same Conditionals.gen dict may be shared across batch items
+            # and across sequential generate_batch calls).
+            ref_dict = dict(ref_dict)
             # type/device/dtype casting (all values will be numpy if it's from a prod API call)
             for rk in list(ref_dict):
                 if isinstance(ref_dict[rk], np.ndarray):
