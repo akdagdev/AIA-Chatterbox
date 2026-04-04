@@ -221,6 +221,13 @@ class ChatterboxMultilingualTTS:
         if str(device).startswith("cuda"):
             cc_major, _ = torch.cuda.get_device_capability(device)
             t3.tfmr.to(torch.bfloat16)  # Llama backbone only
+
+            # Fuse BEFORE quantization so fused weights (QKV, MLP gate_up) are
+            # regular tensors that torchao can quantize. Reversing this order
+            # makes torch.cat fail on AffineQuantizedTensor → fusions skipped →
+            # INT8 bandwidth gain cancelled by extra kernel launches.
+            t3.init_patched_model()
+
             quant_mode = os.environ.get("T3_QUANTIZE", "").lower()
             if quant_mode in ("int8", "int4"):
                 try:
@@ -235,7 +242,8 @@ class ChatterboxMultilingualTTS:
                 if quant_mode in ("int8", "int4"):
                     try:
                         config = Int8WeightOnlyConfig() if quant_mode == "int8" else Int4WeightOnlyConfig()
-                        quantize_(t3.tfmr, config)
+                        # Quantize the fused model (patched_model.model = t3.tfmr)
+                        quantize_(t3.patched_model.model, config)
                         _log.info("T3 Llama backbone: %s weight-only + BF16 compute (cc %d.x)", quant_mode.upper(), cc_major)
                     except Exception as e:
                         _log.warning("T3_QUANTIZE=%s failed: %s — staying BF16", quant_mode, e)
