@@ -405,6 +405,37 @@ class ChatterboxMultilingualTTS:
         multi_step_n=4,
         t3_params={},
     ):
+        """Full generate: T3 → S3Gen → watermark.  Thread-safe."""
+        t3r = self.generate_t3(
+            text=text, language_id=language_id,
+            audio_prompt_path=audio_prompt_path, conditionals=conditionals,
+            exaggeration=exaggeration, cfg_weight=cfg_weight, temperature=temperature,
+            max_new_tokens=max_new_tokens, max_cache_len=max_cache_len,
+            repetition_penalty=repetition_penalty, min_p=min_p, top_p=top_p,
+            multi_step_n=multi_step_n, t3_params=t3_params,
+        )
+        return self.generate_s3gen(t3r)
+
+    # ─── Single-item T3 phase ────────────────────────────────────────
+
+    def generate_t3(
+        self,
+        text,
+        language_id,
+        audio_prompt_path=None,
+        conditionals: Conditionals = None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        max_new_tokens=1000,
+        max_cache_len=1500,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        multi_step_n=4,
+        t3_params={},
+    ) -> T3PhaseResult:
+        """Text → speech tokens.  Thread-safe, runs on default CUDA stream."""
         import os
         if os.environ.get("T3_PROFILE") == "1":
             t3_params = {**t3_params, "profile_t3": True, "benchmark_t3": True}
@@ -416,7 +447,7 @@ class ChatterboxMultilingualTTS:
                 f"Unsupported language_id '{language_id}'. "
                 f"Supported languages: {supported_langs}"
             )
-        
+
         # Resolve conditionals into a local variable (thread-safe)
         if conditionals is not None:
             conds = conditionals
@@ -443,14 +474,13 @@ class ChatterboxMultilingualTTS:
         text = punc_norm(text)
         text_tokens = self.tokenizer.text_to_tokens(text, language_id=language_id.lower() if language_id else None).to(self.device)
         if cfg_weight > 0.0:
-            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
 
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
-        t0 = time.perf_counter()
         with torch.inference_mode():
             _is_cuda = self.device == "cuda" or (hasattr(self.device, "type") and self.device == "cuda")
             try:
@@ -478,21 +508,42 @@ class ChatterboxMultilingualTTS:
                 torch.cuda.synchronize()
             t_t3 = time.perf_counter() - t_t3_start
 
+        return T3PhaseResult(
+            speech_tokens=speech_tokens,
+            item_ref_dicts=[conds.gen],
+            batch_size=1,
+            t_t3=t_t3,
+        )
+
+    # ─── Single-item S3Gen phase ─────────────────────────────────────
+
+    def generate_s3gen(self, t3_result: T3PhaseResult) -> torch.Tensor:
+        """Speech tokens → watermarked waveform [1, samples].
+        Runs on a dedicated CUDA stream (S3Gen copy 1), can overlap with T3."""
+        speech_tokens = t3_result.speech_tokens
+        ref_dict = t3_result.item_ref_dicts[0]
+        t_t3 = t3_result.t_t3
+
+        with torch.inference_mode():
             # Extract only the conditional batch.
             speech_tokens = speech_tokens[0]
-
-            # TODO: output becomes 1D
             speech_tokens = drop_invalid_tokens(speech_tokens)
             speech_tokens = speech_tokens.to(self.device)
 
-            # Use FP16 compiled copy for inference if available (copy 0 is FP32, for embed_ref only)
             s3gen_infer = self.s3gen_copies[1] if len(self.s3gen_copies) > 1 else self.s3gen
+
+            _is_cuda = self.device == "cuda" or (hasattr(self.device, "type") and self.device == "cuda")
+            try:
+                _is_cuda = next(self.t3.patched_model.parameters()).is_cuda
+            except Exception:
+                pass
+
             if _is_cuda:
                 torch.cuda.synchronize()
             t_s3_start = time.perf_counter()
             wav, _ = s3gen_infer.inference(
                 speech_tokens=speech_tokens,
-                ref_dict=conds.gen,
+                ref_dict=ref_dict,
             )
             if _is_cuda:
                 torch.cuda.synchronize()
@@ -501,14 +552,13 @@ class ChatterboxMultilingualTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
 
-        total = time.perf_counter() - t0
         n_tokens = len(speech_tokens)
         audio_dur = n_tokens * 2 * 480 / self.sr
         from .models.s3gen.flow import S3GEN_EULER_STEPS
         _log.info(
             f"[SINGLE] T3={t_t3:.3f}s ({n_tokens} tokens, {n_tokens/t_t3:.0f} tok/s) | "
-            f"S3Gen={t_s3:.3f}s (euler={S3GEN_EULER_STEPS}) | total={total:.3f}s | "
-            f"audio={audio_dur:.2f}s | RTF={total/audio_dur:.3f}"
+            f"S3Gen={t_s3:.3f}s (euler={S3GEN_EULER_STEPS}) | total={t_t3+t_s3:.3f}s | "
+            f"audio={audio_dur:.2f}s | RTF={(t_t3+t_s3)/audio_dur:.3f}"
         )
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
