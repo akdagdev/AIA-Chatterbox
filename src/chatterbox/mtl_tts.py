@@ -211,9 +211,8 @@ class ChatterboxMultilingualTTS:
         # (8 exponent bits) so attention scores and RMSNorm don't overflow/underflow
         # like FP16. Embeddings, conditioning, position embeddings, and the
         # speech_head projection stay FP32 for logit precision.
-        # Skip on GPUs beyond PyTorch's supported compute capability (e.g. GB10 cc 12.1
-        # with PyTorch max 12.0) — fallback kernels cause 6× regression.
-        #
+        # BF16 conversion is applied unconditionally on all CUDA GPUs including
+        # Blackwell (sm_120) — bfloat16 is natively supported on all sm_80+.
         # Optional weight quantization (set T3_QUANTIZE env var):
         #   T3_QUANTIZE=int8 — INT8 weight-only (2× bandwidth reduction vs BF16)
         #   T3_QUANTIZE=int4 — INT4 weight-only (4× vs BF16, quality risk)
@@ -221,31 +220,28 @@ class ChatterboxMultilingualTTS:
         # Requires torchao package. Quality impact needs per-GPU testing.
         if str(device).startswith("cuda"):
             cc_major, _ = torch.cuda.get_device_capability(device)
-            if cc_major < 12:
-                t3.tfmr.to(torch.bfloat16)  # Llama backbone only
-                quant_mode = os.environ.get("T3_QUANTIZE", "").lower()
+            t3.tfmr.to(torch.bfloat16)  # Llama backbone only
+            quant_mode = os.environ.get("T3_QUANTIZE", "").lower()
+            if quant_mode in ("int8", "int4"):
+                try:
+                    from torchao.quantization import (
+                        Int4WeightOnlyConfig,
+                        Int8WeightOnlyConfig,
+                        quantize_,
+                    )
+                except ImportError:
+                    _log.warning("T3_QUANTIZE=%s requested but torchao not installed, staying BF16", quant_mode)
+                    quant_mode = ""
                 if quant_mode in ("int8", "int4"):
                     try:
-                        from torchao.quantization import (
-                            Int4WeightOnlyConfig,
-                            Int8WeightOnlyConfig,
-                            quantize_,
-                        )
-                    except ImportError:
-                        _log.warning("T3_QUANTIZE=%s requested but torchao not installed, staying BF16", quant_mode)
-                        quant_mode = ""
-                    if quant_mode in ("int8", "int4"):
-                        try:
-                            config = Int8WeightOnlyConfig() if quant_mode == "int8" else Int4WeightOnlyConfig()
-                            quantize_(t3.tfmr, config)
-                            _log.info("T3 Llama backbone: %s weight-only + BF16 compute (cc %d.x)", quant_mode.upper(), cc_major)
-                        except Exception as e:
-                            _log.warning("T3_QUANTIZE=%s failed: %s — staying BF16", quant_mode, e)
-                            _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
-                else:
-                    _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
+                        config = Int8WeightOnlyConfig() if quant_mode == "int8" else Int4WeightOnlyConfig()
+                        quantize_(t3.tfmr, config)
+                        _log.info("T3 Llama backbone: %s weight-only + BF16 compute (cc %d.x)", quant_mode.upper(), cc_major)
+                    except Exception as e:
+                        _log.warning("T3_QUANTIZE=%s failed: %s — staying BF16", quant_mode, e)
+                        _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
             else:
-                _log.info("T3 staying FP32 — compute capability %d.x exceeds PyTorch support", cc_major)
+                _log.info("T3 Llama backbone running in BF16 (cc %d.x)", cc_major)
 
         # Note: torch.compile on the module only wraps forward() (training path).
         # Inference uses inference()/inference_batch() which bypass compiled forward.
