@@ -517,6 +517,15 @@ class T3(nn.Module):
                 forward passes in a single graph, amortizing Python overhead by N.
                 Only effective with generate_token_backend="cudagraphs-manual".
         """
+        # torch.compile and manual CUDA graphs are incompatible — inductor's
+        # constant folding allocates GPU memory which fails inside graph capture.
+        # When T3_COMPILE=1, force eager generation loop and let inductor's
+        # kernel fusion provide the speedup instead of manual CUDA graphs.
+        import os
+        if os.environ.get("T3_COMPILE") == "1":
+            generate_token_backend = "eager"
+            multi_step_n = 1
+
         # Validate / sanitize inputs
         assert prepend_prompt_speech_tokens is None, "not implemented"
         _ensure_BOT_EOT(text_tokens, self.hp)
