@@ -519,34 +519,40 @@ class ChatterboxMultilingualTTS:
 
     def generate_s3gen(self, t3_result: T3PhaseResult) -> torch.Tensor:
         """Speech tokens → watermarked waveform [1, samples].
-        Runs on a dedicated CUDA stream (S3Gen copy 1), can overlap with T3."""
+        Runs on a dedicated CUDA stream so it can truly overlap with T3 on
+        the default stream (T3 is memory-bw bound, S3Gen is compute bound)."""
         speech_tokens = t3_result.speech_tokens
         ref_dict = t3_result.item_ref_dicts[0]
         t_t3 = t3_result.t_t3
 
         with torch.inference_mode():
-            # Extract only the conditional batch.
             speech_tokens = speech_tokens[0]
             speech_tokens = drop_invalid_tokens(speech_tokens)
             speech_tokens = speech_tokens.to(self.device)
 
             s3gen_infer = self.s3gen_copies[1] if len(self.s3gen_copies) > 1 else self.s3gen
 
-            _is_cuda = self.device == "cuda" or (hasattr(self.device, "type") and self.device == "cuda")
-            try:
-                _is_cuda = next(self.t3.patched_model.parameters()).is_cuda
-            except Exception:
-                pass
+            _is_cuda = torch.cuda.is_available()
 
+            # Lazy-init a dedicated CUDA stream for single-item S3Gen pipeline.
+            # Reuses the first batch stream if available, otherwise creates one.
             if _is_cuda:
-                torch.cuda.synchronize()
+                if not hasattr(self, '_s3gen_single_stream'):
+                    self._s3gen_single_stream = torch.cuda.Stream()
+
             t_s3_start = time.perf_counter()
-            wav, _ = s3gen_infer.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=ref_dict,
-            )
             if _is_cuda:
-                torch.cuda.synchronize()
+                with torch.cuda.stream(self._s3gen_single_stream):
+                    wav, _ = s3gen_infer.inference(
+                        speech_tokens=speech_tokens,
+                        ref_dict=ref_dict,
+                    )
+                self._s3gen_single_stream.synchronize()
+            else:
+                wav, _ = s3gen_infer.inference(
+                    speech_tokens=speech_tokens,
+                    ref_dict=ref_dict,
+                )
             t_s3 = time.perf_counter() - t_s3_start
 
             wav = wav.squeeze(0).detach().cpu().numpy()
